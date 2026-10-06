@@ -8,11 +8,22 @@ from data.fetch_mt5 import fetch_mt5_candles
 from indicators.trend import calculate_atr
 from execution.mt5_executor import get_open_mt5_positions, modify_position_sl
 from execution.position_tracker import get_position_state, get_all_tracked_tickets
-from config.settings import ATR_TRAILING_MULTIPLIER # Asumiremos que existe o usaremos un default
+from config.settings import ADX_THRESHOLD
+try:
+    from config.settings import ATR_TRAILING_MULTIPLIER
+except ImportError:
+    ATR_TRAILING_MULTIPLIER = 2.0
 
 # Configuración por defecto si no está en settings
 DEFAULT_TRAILING_MULTIPLIER = 2.0
 BREAKEVEN_RATIO = 1.0  # Mover a BE cuando el profit es 1x el riesgo original
+
+def run_monitor():
+    """
+    Función de entrada para el monitor.
+    Llama a la actualización de stops.
+    """
+    update_trailing_stops()
 
 def update_trailing_stops():
     """

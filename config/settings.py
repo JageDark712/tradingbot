@@ -78,6 +78,8 @@ MULTI_TP_LEVELS = [
     (3.0, 0.34),   # TP3: 3.0x el riesgo, cierra el resto (34%)
 ]
 
+ATR_TRAILING_MULTIPLIER = 2.0  # Multiplicador para el Trailing Stop basado en ATR
+
 # Capital operativo para calcular riesgo. None = usa el balance real de la cuenta.
 # Ej.: 50.0 para simular una cuenta de $50 sobre la demo de $500.
 OPERATING_CAPITAL = None
