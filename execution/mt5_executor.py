@@ -115,37 +115,56 @@ def close_mt5_position(ticket: int) -> dict:
     return {"success": True, "ticket": ticket}
 
 
+def _send_with_fill_fallback(mt5, base_request: dict):
+    """Prueba varios modos de llenado; 10030 = modo no soportado por el símbolo."""
+    fillings = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+    last = None
+    for filling in fillings:
+        request = dict(base_request)
+        request["type_filling"] = filling
+        result = mt5.order_send(request)
+        last = result
+        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return True, result
+        if result is not None and result.retcode != 10030:
+            break
+    return False, last
+
+
+def _describe_failure(mt5, result) -> str:
+    if result is not None:
+        return f"retcode={result.retcode}, comment={result.comment}"
+    return f"sin respuesta ({mt5.last_error()})"
+
+
 def partial_close_position(ticket: int, volume_to_close: float) -> dict:
     """Cierra una fracción del volumen de una posición abierta."""
     mt5 = get_mt5_connection()
     positions = mt5.positions_get(ticket=ticket)
-
     if not positions:
         return {"success": False, "error": f"No se encontró posición con ticket {ticket}"}
 
     pos = positions[0]
     tick = mt5.symbol_info_tick(pos.symbol)
-
     close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
     price = float(tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask)
 
-    request = {
+    base_request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": pos.symbol,
         "volume": float(round(volume_to_close, 2)),
         "type": close_type,
-        "position": ticket,
+        "position": int(ticket),
         "price": price,
         "deviation": 20,
         "magic": 123456,
         "comment": "cierre_parcial_tp",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
-    result = mt5.order_send(request)
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        return {"success": False, "error": f"No se pudo cerrar parcialmente ticket {ticket}"}
+    ok, result = _send_with_fill_fallback(mt5, base_request)
+    if not ok:
+        return {"success": False, "error": f"cierre parcial ticket {ticket}: {_describe_failure(mt5, result)}"}
 
     return {"success": True, "ticket": ticket, "volume_closed": volume_to_close}
 
@@ -154,23 +173,21 @@ def modify_position_sl(ticket: int, new_sl: float) -> dict:
     """Modifica el stop loss de una posición abierta (sin tocar el TP)."""
     mt5 = get_mt5_connection()
     positions = mt5.positions_get(ticket=ticket)
-
     if not positions:
         return {"success": False, "error": f"No se encontró posición con ticket {ticket}"}
 
     pos = positions[0]
-
     request = {
         "action": mt5.TRADE_ACTION_SLTP,
         "symbol": pos.symbol,
-        "position": ticket,
+        "position": int(ticket),
         "sl": float(round(new_sl, 5)),
         "tp": float(pos.tp),
     }
 
     result = mt5.order_send(request)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        return {"success": False, "error": f"No se pudo modificar SL de ticket {ticket}"}
+        return {"success": False, "error": f"modificar SL ticket {ticket}: {_describe_failure(mt5, result)}"}
 
     return {"success": True, "ticket": ticket, "new_sl": new_sl}
 
@@ -240,3 +257,56 @@ def estimate_position_open_risk(pos: dict) -> float:
     if profit is None:
         return 0.0
     return max(0.0, -float(profit))
+
+
+def check_symbol_tradable(symbol: str, direction: str) -> tuple:
+    """Verifica que el broker permita operar el símbolo en esa dirección."""
+    mt5 = get_mt5_connection()
+    mt5_symbol = to_mt5_symbol(symbol)
+    mt5.symbol_select(mt5_symbol, True)
+    info = mt5.symbol_info(mt5_symbol)
+    if info is None:
+        return False, "símbolo no disponible en el broker"
+
+    mode = int(info.trade_mode)  # 0 deshabilitado, 1 solo compras, 2 solo ventas, 3 solo cierre, 4 completo
+    if mode == 4:
+        return True, "OK"
+    if mode == 1 and direction == "alcista":
+        return True, "OK"
+    if mode == 2 and direction == "bajista":
+        return True, "OK"
+
+    nombres = {0: "deshabilitado", 1: "solo compras", 2: "solo ventas", 3: "solo cierre"}
+    return False, f"trading {nombres.get(mode, mode)} en este símbolo"
+
+
+def calculate_fixed_volume(symbol: str, direction: str, entry_price: float,
+                           sl_price: float, fixed_lot: float) -> dict:
+    """Usa un lote fijo (ajustado a mínimo/paso/máximo) y calcula el riesgo real en dinero."""
+    import math
+    mt5 = get_mt5_connection()
+    mt5_symbol = to_mt5_symbol(symbol)
+    mt5.symbol_select(mt5_symbol, True)
+    info = mt5.symbol_info(mt5_symbol)
+    if info is None:
+        return {"volume": None, "reason": f"sin información del símbolo {mt5_symbol}"}
+
+    step, vmin, vmax = float(info.volume_step), float(info.volume_min), float(info.volume_max)
+    volume = math.floor(fixed_lot / step + 1e-9) * step
+    volume = round(max(vmin, min(vmax, volume)), 2)
+
+    order_type = mt5.ORDER_TYPE_BUY if direction == "alcista" else mt5.ORDER_TYPE_SELL
+    pnl = mt5.order_calc_profit(order_type, mt5_symbol, volume, float(entry_price), float(sl_price))
+    if pnl is None or pnl >= 0:
+        return {"volume": None, "reason": "no se pudo calcular el riesgo del lote"}
+
+    return {"volume": volume, "actual_risk": abs(float(pnl)), "reason": "OK"}
+
+
+def distance_in_points(symbol: str, price_distance: float):
+    """Convierte una distancia de precio a puntos del símbolo (1 punto = el mínimo movimiento de precio)."""
+    mt5 = get_mt5_connection()
+    info = mt5.symbol_info(to_mt5_symbol(symbol))
+    if info is None or not info.point:
+        return None
+    return int(round(abs(float(price_distance)) / float(info.point)))

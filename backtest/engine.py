@@ -1,17 +1,20 @@
 """
 Motor de backtest para la estrategia de trend following multi-timeframe.
 Simula entradas en señales de confluencia (D1+H4+H1 alineados), con
-stop loss basado en ATR y ratio riesgo:beneficio 1:3, con cierre
+stop loss y take profit en múltiplos de ATR (ver config/settings.py), con cierre
 anticipado si aparece señal contraria.
 """
 import pandas as pd
 import numpy as np
 
 from indicators.trend import calculate_trend_series, calculate_atr
-from config.settings import TIMEFRAMES, ADX_THRESHOLD
+from config.settings import (
+    TIMEFRAMES, ADX_THRESHOLD, SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER, MULTI_TP_LEVELS,
+)
 
-RISK_REWARD_RATIO = 3.0
-ATR_SL_MULTIPLIER = 1.5  # SL a 1.5x ATR de distancia
+# Se derivan de config/settings.py para que scanner y backtest usen siempre las mismas distancias
+ATR_SL_MULTIPLIER = SL_ATR_MULTIPLIER                        # SL a N x ATR
+RISK_REWARD_RATIO = TP_ATR_MULTIPLIER / SL_ATR_MULTIPLIER    # TP final en múltiplos del riesgo
 
 
 def align_multi_timeframe(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame) -> pd.DataFrame:
@@ -53,83 +56,95 @@ def generate_signals(merged: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def simulate_trades(merged: pd.DataFrame) -> pd.DataFrame:
+def simulate_trades(merged: pd.DataFrame, sl_mult=None, tp_mult=None,
+                    max_hold_bars=None, ladder=False, cost_atr=0.0) -> pd.DataFrame:
     """
     Simula trades: entra en la primera vela con señal (si no hay posición
-    abierta), sale por SL, TP, o señal contraria. Un trade a la vez.
+    abierta), sale por SL, TP, señal contraria o (opcional) límite de tiempo.
+    Un trade a la vez. PnL en R-múltiplos (1R = riesgo inicial del stop).
 
-    PnL expresado en R-múltiplos (1R = riesgo asumido en el stop loss).
+    sl_mult / tp_mult: distancias en múltiplos de ATR (por defecto, las de settings).
+    max_hold_bars:     cierra a mercado tras N velas H1 (ej. 5 = "4 o 5 horas").
+    ladder:            aplica el SL escalonado (TP1 -> breakeven, TP2 -> SL en TP1).
+                       El SL nuevo rige desde la vela siguiente (sin look-ahead).
+    cost_atr:          costo por trade (spread + deslizamiento) en múltiplos de ATR.
     """
+    sl_mult = ATR_SL_MULTIPLIER if sl_mult is None else sl_mult
+    tp_mult = TP_ATR_MULTIPLIER if tp_mult is None else tp_mult
+    lvl1, lvl2 = MULTI_TP_LEVELS[0][0], MULTI_TP_LEVELS[1][0]
+
+    times = merged["time"].to_numpy()
+    highs = merged["high"].to_numpy(float)
+    lows = merged["low"].to_numpy(float)
+    closes = merged["close"].to_numpy(float)
+    atrs = merged["atr"].to_numpy(float)
+    signals = merged["signal"].to_numpy()
+
     trades = []
     in_position = False
-    direction = None
-    entry_price = None
-    sl_price = None
-    tp_price = None
-    entry_time = None
+    entry_i = sign = entry = sl0 = sl = tp = risk0 = atr = None
 
     for i in range(1, len(merged)):
-        row = merged.iloc[i]
-
         if not in_position:
-            if row["signal"] in ("alcista", "bajista") and not pd.isna(row["atr"]):
-                direction = row["signal"]
-                entry_price = row["close"]
-                atr = row["atr"]
-
-                if direction == "alcista":
-                    sl_price = entry_price - atr * ATR_SL_MULTIPLIER
-                    tp_price = entry_price + atr * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO
-                else:
-                    sl_price = entry_price + atr * ATR_SL_MULTIPLIER
-                    tp_price = entry_price - atr * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO
-
-                entry_time = row["time"]
+            if signals[i] in ("alcista", "bajista") and not np.isnan(atrs[i]):
+                sign = 1 if signals[i] == "alcista" else -1
+                entry = closes[i]
+                atr = atrs[i]
+                risk0 = atr * sl_mult
+                sl0 = sl = entry - sign * risk0
+                tp = entry + sign * atr * tp_mult
+                entry_i = i
                 in_position = True
+            continue
+
+        if sign == 1:
+            hit_sl, hit_tp, contra = lows[i] <= sl, highs[i] >= tp, signals[i] == "bajista"
         else:
-            exit_reason = None
-            exit_price = None
+            hit_sl, hit_tp, contra = highs[i] >= sl, lows[i] <= tp, signals[i] == "alcista"
 
-            if direction == "alcista":
-                if row["low"] <= sl_price:
-                    exit_reason, exit_price = "SL", sl_price
-                elif row["high"] >= tp_price:
-                    exit_reason, exit_price = "TP", tp_price
-                elif row["signal"] == "bajista":
-                    exit_reason, exit_price = "señal_contraria", row["close"]
-            else:
-                if row["high"] >= sl_price:
-                    exit_reason, exit_price = "SL", sl_price
-                elif row["low"] <= tp_price:
-                    exit_reason, exit_price = "TP", tp_price
-                elif row["signal"] == "alcista":
-                    exit_reason, exit_price = "señal_contraria", row["close"]
+        reason = exit_price = None
+        if hit_sl:
+            reason, exit_price = ("SL" if sl == sl0 else "SL_escalonado"), sl
+        elif hit_tp:
+            reason, exit_price = "TP", tp
+        elif contra:
+            reason, exit_price = "señal_contraria", closes[i]
+        elif max_hold_bars is not None and i - entry_i >= max_hold_bars:
+            reason, exit_price = "tiempo", closes[i]
 
-            if exit_reason:
-                risk = abs(entry_price - sl_price)
-                raw_pnl = (exit_price - entry_price) if direction == "alcista" else (entry_price - exit_price)
-                pnl_r = raw_pnl / risk if risk > 0 else 0
-
-                trades.append({
-                    "entry_time": entry_time,
-                    "exit_time": row["time"],
-                    "direction": direction,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "exit_reason": exit_reason,
-                    "pnl": round(pnl_r, 3),
-                })
-                in_position = False
+        if reason:
+            raw_pnl = (exit_price - entry) * sign
+            pnl_r = (raw_pnl - cost_atr * atr) / risk0 if risk0 > 0 else 0
+            trades.append({
+                "entry_time": times[entry_i],
+                "exit_time": times[i],
+                "direction": "alcista" if sign == 1 else "bajista",
+                "entry_price": entry,
+                "exit_price": exit_price,
+                "exit_reason": reason,
+                "bars_held": i - entry_i,
+                "pnl": round(float(pnl_r), 3),
+            })
+            in_position = False
+        elif ladder:
+            favorable = (highs[i] - entry) if sign == 1 else (entry - lows[i])
+            new_sl = None
+            if favorable >= lvl2 * risk0:
+                new_sl = entry + sign * lvl1 * risk0
+            elif favorable >= lvl1 * risk0:
+                new_sl = entry
+            if new_sl is not None and ((sign == 1 and new_sl > sl) or (sign == -1 and new_sl < sl)):
+                sl = new_sl
 
     return pd.DataFrame(trades)
 
 
-def run_backtest(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame) -> pd.DataFrame:
-    """Pipeline completo: alinea timeframes, genera señales, simula trades."""
+def run_backtest(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame, **exit_params) -> pd.DataFrame:
+    """Pipeline completo: alinea timeframes, genera señales, simula trades.
+    exit_params se pasa a simulate_trades (sl_mult, tp_mult, max_hold_bars, ladder, cost_atr)."""
     merged = align_multi_timeframe(df_bias, df_confirm, df_entry)
     merged = generate_signals(merged)
-    trades = simulate_trades(merged)
-    return trades
+    return simulate_trades(merged, **exit_params)
 
 
 if __name__ == "__main__":

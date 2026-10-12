@@ -12,13 +12,14 @@ import traceback
 
 from config.settings import (
     FOREX_SYMBOLS, CRYPTO_SYMBOLS, COMMODITY_SYMBOLS, ETF_SYMBOLS,
-    CONFLUENCE_THRESHOLD,
+    CONFLUENCE_THRESHOLD, FIXED_LOT, MAX_RISK_PER_TRADE_PCT,
 )
 from scanner.run_scan import run_full_scan
 from risk.engine import RiskEngine
 from execution.mt5_executor import (
     execute_mt5_order, get_open_mt5_positions, get_effective_balance,
     calculate_mt5_volume, estimate_position_open_risk,
+    calculate_fixed_volume, check_symbol_tradable, distance_in_points,
 )
 
 SCAN_INTERVAL_MINUTES = 15
@@ -80,18 +81,42 @@ def select_and_execute(candidates, engine, open_symbols, balance):
             print(f"  [YA ABIERTA] {symbol}")
             continue
 
-        risk_pct = engine.calculate_trade_risk_pct(category, row["strength"])
-        can_open, reason = engine.can_open_trade(category, risk_pct)
-        if not can_open:
-            print(f"  [OMITIDO] {symbol}: {reason}")
+        tradable, why = check_symbol_tradable(symbol, direction)
+        if not tradable:
+            print(f"  [NO OPERABLE] {symbol}: {why}")
             skipped.append(symbol)
             continue
 
-        sizing = calculate_mt5_volume(
-            symbol, direction, row["entry_price"], row["sl_price"], balance * risk_pct
-        )
-        if sizing["volume"] is None:
-            print(f"  [OMITIDO] {symbol}: {sizing['reason']}")
+        if FIXED_LOT is not None:
+            sizing = calculate_fixed_volume(
+                symbol, direction, row["entry_price"], row["sl_price"], FIXED_LOT
+            )
+            if sizing["volume"] is None:
+                print(f"  [OMITIDO] {symbol}: {sizing['reason']}")
+                skipped.append(symbol)
+                continue
+            risk_pct = sizing["actual_risk"] / balance
+            if MAX_RISK_PER_TRADE_PCT is not None and risk_pct > MAX_RISK_PER_TRADE_PCT:
+                print(
+                    f"  [OMITIDO] {symbol}: lote {sizing['volume']} arriesga "
+                    f"${sizing['actual_risk']:.2f} ({risk_pct:.1%}), tope {MAX_RISK_PER_TRADE_PCT:.1%}"
+                )
+                skipped.append(symbol)
+                continue
+        else:
+            risk_pct = engine.calculate_trade_risk_pct(category, row["strength"])
+            sizing = calculate_mt5_volume(
+                symbol, direction, row["entry_price"], row["sl_price"], balance * risk_pct
+            )
+            if sizing["volume"] is None:
+                print(f"  [OMITIDO] {symbol}: {sizing['reason']}")
+                skipped.append(symbol)
+                continue
+            risk_pct = sizing["actual_risk"] / balance
+
+        can_open, reason = engine.can_open_trade(category, risk_pct)
+        if not can_open:
+            print(f"  [OMITIDO] {symbol}: {reason}")
             skipped.append(symbol)
             continue
 
@@ -101,10 +126,10 @@ def select_and_execute(candidates, engine, open_symbols, balance):
         )
 
         if result["success"]:
-            engine.open_trade(symbol, category, direction, sizing["actual_risk"] / balance)
+            engine.open_trade(symbol, category, direction, risk_pct)
             open_symbols.add(symbol)
             executed.append(symbol)
-            print(f"  [✓ EJECUTADO] {symbol} {direction} | lotes={sizing['volume']} | riesgo=${sizing['actual_risk']:.2f}")
+            print(f"  [EJECUTADO] {symbol} {direction} | lotes={sizing['volume']} | riesgo=${sizing['actual_risk']:.2f}")
         else:
             err = str(result.get("error", ""))
             tag = "MERCADO CERRADO" if ("Market closed" in err or "10018" in err) else "FALLÓ"
@@ -128,6 +153,12 @@ def run_one_cycle():
         print("Sin señales en este ciclo.")
         return
 
+    print("\nSeñales por categoría (todas, antes del umbral):")
+    for cat, grp in all_results.groupby("category"):
+        top = grp.sort_values("strength", ascending=False)
+        resumen = ", ".join(f"{r.symbol} {r.direction[:3]} {r.strength:.2f}" for r in top.itertuples())
+        print(f"  {cat}: {resumen}")
+
     candidates = rank_candidates(all_results)
     candidates = candidates[candidates["strength"] >= CONFLUENCE_THRESHOLD]
 
@@ -135,8 +166,11 @@ def run_one_cycle():
         print(f"{len(all_results)} señales, ninguna supera el umbral ({CONFLUENCE_THRESHOLD}).")
         return
 
-    print(f"\n{len(candidates)} candidata(s) en orden de prioridad:")
-    print(candidates[["symbol", "category", "direction", "strength", "agreement"]].to_string(index=False))
+    candidates = candidates.copy()
+    candidates["sl_pts"] = [distance_in_points(r.symbol, r.entry_price - r.sl_price) for r in candidates.itertuples()]
+    candidates["tp_pts"] = [distance_in_points(r.symbol, r.tp_price - r.entry_price) for r in candidates.itertuples()]
+    print(f"\n{len(candidates)} candidata(s) en orden de prioridad (SL y TP en puntos):")
+    print(candidates[["symbol", "category", "direction", "strength", "agreement", "sl_pts", "tp_pts"]].to_string(index=False))
 
     engine, open_symbols = build_engine_from_open_positions(balance)
     print(f"\nPosiciones ya abiertas: {sorted(open_symbols) or 'ninguna'}")

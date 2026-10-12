@@ -1,0 +1,1543 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 466eadc..07f6aa3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,25 @@
+ # Registro de cambios
+ 
+ Formato: fecha, quién (chat / Claude Code), archivos tocados y por qué.
++
++## 2026-10-06 — chat — Arranque del sistema, lote fijo y monitor combinado
++- `config/settings.py`: agrega `FIXED_LOT=0.01`, `MAX_RISK_PER_TRADE_PCT=0.03` y `ATR_TRAILING_MULTIPLIER=2.0`. El monitor importaba esta última y no existía: el ImportError impedía arrancar `run_all.py`.
++- `execution/multi_tp_monitor.py`: reescrito. SL escalonado (TP1=0.5R → breakeven, TP2=1R → SL en TP1) y trailing 2×ATR(H1) tras TP2; el TP final de 3R sigue en la orden. Corrige: faltaba `run_monitor()`; doble sufijo `m` al pedir velas (`ETHUSDmm`); el breakeven usaba el SL actual y podía aflojar un stop ya subido por el trailing. Sin cierres parciales (lote 0.01).
++- `execution/mt5_executor.py`: agrega `check_symbol_tradable` y `calculate_fixed_volume`; los errores de cierre/modificación muestran el retcode real; el cierre parcial prueba otros modos de llenado.
++- `scanner/run_live.py`: lote fijo con tope de riesgo por trade; verifica que el símbolo sea operable antes de enviar la orden; imprime las señales de todas las categorías antes de aplicar el umbral.
++- `README.md` y `requirements.txt`: reescritos para reflejar el flujo real (solo MT5) y las limitaciones medidas.
++- Sin tocar, por decisión del usuario (solo hacer que arranque): régimen, pesos de confluencia y límites de riesgo de Claude Code (`MAX_TRADES_PER_CATEGORY=5`, `MAX_AGGREGATE_RISK=5%`). Ver "Limitaciones conocidas" en el README.
++
++## 2026-10-08 — chat — Salidas cortas (objetivo en ~4–5 horas)
++- `config/settings.py`: nuevos `SL_ATR_MULTIPLIER=1.0` y `TP_ATR_MULTIPLIER=1.5` (antes fijos en `backtest/engine.py`: 1.5 y 4.5). El TP final de `MULTI_TP_LEVELS` se deriva de ellos.
++- `backtest/engine.py`: toma los multiplicadores de settings; `simulate_trades` y `run_backtest` aceptan `sl_mult`, `tp_mult`, `max_hold_bars`, `ladder` y `cost_atr`. Con los valores anteriores reproduce idénticos los trades (probado con 300).
++- `backtest/sweep_exits.py` (nuevo): compara perfiles de SL/TP, con y sin SL escalonado, con y sin límite de 5 h, con y sin costo.
++- `scanner/run_live.py` y `execution/mt5_executor.py`: las candidatas muestran SL y TP en puntos.
++- Motivo: con SL 1.5 ATR y TP 4.5 ATR, el TP se alcanzaba en ≤ 5 h solo el 0.7% de las veces en un mercado sin ventaja (simulación): era un objetivo de varios días.
++- Pendiente: validar el perfil corto con `backtest.sweep_exits` sobre datos reales y varios símbolos antes de darlo por bueno.
++
++## 2026-10-08 — chat — Reconciliación con `559da77`, verificaciones y tareas pendientes
++- El monitor que dejó Claude Code en `559da77` (`run_monitor()` hacía una sola pasada y terminaba) se sustituye por el monitor combinado con bucle. Con `run_all`, el monitor moría tras un ciclo y nadie gestionaba el SL.
++- `config/settings.py`: una sola definición de `ATR_TRAILING_MULTIPLIER` (la de `559da77` y la de este parche coincidían en 2.0).
++- `tests/verify_*.py` (nuevos): motor de backtest (incluye regresión contra `tests/_engine_old_reference.py`), monitor y selección con un MT5 simulado, y escaneo completo sintético.
++- `docs/TAREAS_CLAUDE_CODE.md` (nuevo): tareas pendientes por fases.
+diff --git a/README.md b/README.md
+index 264aa2c..91e0551 100644
+--- a/README.md
++++ b/README.md
+@@ -1,52 +1,84 @@
+-# Trading Scanner 📈
++# Trading Scanner
+ 
+-Sistema de trading algorítmico multi-activo y multi-estrategia diseñado para la detección de oportunidades en tiempo real, filtrado por confluencia y gestión de riesgo adaptativa.
++Scanner multi-activo y multi-estrategia: busca setups en forex, cripto, materias primas e índices, los combina por confluencia y opera en **cuenta demo de Exness (MT5)**.
+ 
+-## 🏗️ Arquitectura del Sistema
++> Proyecto en desarrollo. Lo único validado con backtest es trend following en EURUSD. Ver [Limitaciones conocidas](#limitaciones-conocidas).
+ 
+-El proyecto sigue un pipeline lineal y modular para garantizar que solo las señales de alta probabilidad lleguen a la ejecución:
++## Pipeline
+ 
+-`Data` $\rightarrow$ `Market Regime` $\rightarrow$ `Strategies` $\rightarrow$ `Confluence` $\rightarrow$ `Risk` $\rightarrow$ `Execution` $\rightarrow$ `Monitoring`
++`data → indicators → strategies → regime → confluence → risk → execution → monitor`
+ 
+-### Componentes Principales:
++| Carpeta | Qué hace |
++|---|---|
++| `data/` | Velas desde MT5 vía `mt5linux` (`fetch_mt5.py`). `fetch_binance*.py` es código heredado, fuera del flujo actual. |
++| `indicators/` | EMA, ADX, ATR (`trend.py`) y ROC (`momentum.py`). |
++| `strategies/` | `trend_following.py`: D1 sesgo, H4 confirmación, H1 entrada (solo hay señal si los tres coinciden). `momentum.py`: ROC 20/60/120 en D1. |
++| `regime/` | Detector Hurst + ADX (TRENDING / RANGING / RANDOM). **Experimental.** |
++| `confluence/` | Combina las estrategias en un score 0–1. Pesos 0.6/0.4 por defecto, o dinámicos según el régimen. Una sola estrategia activa multiplica el score por 0.6; si se contradicen, el score es 0; en RANDOM multiplica además por 0.7. |
++| `risk/` | `RiskEngine`: límites de trades por categoría y de riesgo agregado, y sizing adaptativo (solo si `FIXED_LOT = None`). |
++| `execution/` | `mt5_executor.py`: órdenes con SL y TP en la misma orden, lote fijo, verificación de símbolo operable. `multi_tp_monitor.py`: gestión de salida. `position_tracker.py`: registro local del riesgo original de cada posición. `binance_*`: heredado. |
++| `scanner/` | `run_scan.py` analiza todo el universo; `run_live.py` es el ciclo (analiza, rankea, ejecuta); `run_all.py` lo levanta todo con un solo comando. |
++| `backtest/` | Motor in-sample / out-of-sample (`engine.py`, `metrics.py`, `run_backtest_eurusd.py`). |
++| `config/` | Parámetros (`settings.py`) y mapeo de símbolos (`symbols.py`, sufijo `m` de Exness). |
+ 
+-- **`data/`**: Conectores para obtención de velas (candles) desde MetaTrader 5 (MT5) y Binance.
+-- **`regime/`**: Detector de régimen de mercado utilizando el **Exponente de Hurst** y **ADX** para clasificar el mercado en `TRENDING`, `RANGING` o `RANDOM`.
+-- **`indicators/`**: Cálculos técnicos personalizados (EMA, ADX, ATR).
+-- **`strategies/`**:
+-    - `TrendFollowingStrategy`: Análisis multi-timeframe (D1, H4, H1).
+-    - `MomentumStrategy`: Análisis de fuerza relativa y ranking cross-sectional.
+-- **`confluence/`**: Motor de scoring con **Pesos Dinámicos**. Ajusta la importancia de cada estrategia según el régimen detectado.
+-- **`risk/`**: Gestión de riesgo adaptativa, cálculo de tamaño de posición basado en Stop Loss y control de exposición agregada.
+-- **`execution/`**: Ejecutores para MT5 y Binance con soporte para Bracket Orders (SL/TP).
+-- **`monitoring/`**: Sistema de **Trailing Stop basado en ATR** y movimiento automático a Breakeven para proteger el capital.
++## Reglas de operación vigentes
+ 
+-## 🚀 Flujo de Trabajo
++- **Universo:** 5 cripto (BTC, ETH, BNB, SOL, XRP), 10 forex, XAUUSD, USOIL, XNGUSD y 4 índices (US500, USTEC, US30, UK100). En MT5 cada símbolo lleva el sufijo `m`.
++- **Selección:** se analiza TODO el universo, se rankea por score (desempate: coincidencia completa de estrategias y luego momentum) y se opera en ese orden. Entra si el score es ≥ `CONFLUENCE_THRESHOLD` (0.6). Si una orden falla (mercado cerrado, símbolo no operable) pasa a la siguiente; un cupo solo se consume si la orden se ejecuta. El ciclo se repite cada 15 minutos.
++- **Stop y objetivo:** SL inicial a `SL_ATR_MULTIPLIER` × ATR(H1) (1.0) y TP final a `TP_ATR_MULTIPLIER` × ATR(H1) (1.5), ambos dentro de la orden. Es un objetivo corto, pensado para cumplirse en ~4–5 horas; el perfil anterior era 1.5 / 4.5 (swing de varios días). El ciclo imprime el SL y el TP de cada candidata en puntos.
++- **Tamaño:** lote fijo `FIXED_LOT = 0.01`. El trade se omite si ese lote arriesga más de `MAX_RISK_PER_TRADE_PCT` (3%) del capital operativo. Con `FIXED_LOT = None` se usa el sizing por riesgo adaptativo.
++- **Límites:** `MAX_TRADES_PER_CATEGORY` y `MAX_AGGREGATE_RISK` en `config/settings.py`.
++- **Salida (monitor, cada 30 s):** al llegar a TP1 (0.5R) el SL pasa a breakeven; al llegar a TP2 (1R) pasa al nivel de TP1; después hay trailing a 2 × ATR(H1) (`ATR_TRAILING_MULTIPLIER`). El SL nunca se afloja. Con el TP final a 1.5R el trailing casi no llega a actuar: el SL escalonado hace el trabajo. No hay cierres parciales: con 0.01 lotes la posición no se puede dividir.
++- **Capital:** `OPERATING_CAPITAL = None` usa el balance real de la cuenta; `50.0` simula una cuenta de $50.
+ 
+-1. **Escaneo**: `scanner/run_scan.py` recorre el universo de símbolos.
+-2. **Contextualización**: Se detecta el régimen de mercado para cada activo.
+-3. **Evaluación**: Se ejecutan las estrategias y se combinan mediante la confluencia adaptativa.
+-4. **Filtrado**: El `RiskEngine` valida si el trade es viable según el balance de la cuenta y el riesgo permitido.
+-5. **Ejecución**: Se abre la posición en el broker.
+-6. **Seguimiento**: `execution/multi_tp_monitor.py` gestiona la salida dinámica del trade.
++## Cómo correrlo (Linux Mint + Wine + mt5linux)
+ 
+-## 🛠️ Instalación y Uso
++Requisitos: Python 3.10 en un venv, MT5 de Exness instalado en Wine con sesión demo iniciada, y **AutoTrading activado** (se desactiva cada vez que se reinicia MT5).
+ 
+-### Requisitos
+-- Python 3.10+
+-- MetaTrader 5 instalado (para Forex/Commodities)
+-- API Keys de Binance (para Cripto)
++```bash
++pip install -r requirements.txt
++pip install mt5linux==0.1.9 --no-deps
++```
++
++Siempre desde la raíz del proyecto y con `-m`:
+ 
+-### Ejecución
+-Para correr un escaneo completo:
+ ```bash
+-python scanner/run_scan.py
++./start_mt5.sh                          # abre MT5 y el servidor mt5linux (ajusta las rutas del script a tu usuario)
++python -m scanner.run_live --once       # un solo ciclo; puede abrir órdenes en la demo
++python -m scanner.run_all               # todo junto: MT5 + scanner + monitor
++python -m execution.multi_tp_monitor    # solo el monitor
++python -m backtest.run_backtest_eurusd  # backtest de trend following en EURUSD
++python -m backtest.sweep_exits EURUSD GBPUSD  # compara perfiles de SL/TP/escalonado/límite de 5 h con tus datos
+ ```
+ 
+-Para actualizar los stops de las posiciones abiertas:
++Para dejarlo corriendo todo el día usa `tmux` y evita que el equipo se suspenda. Si el mercado de un símbolo está cerrado, ese ciclo lo omite y lo reintenta en el siguiente.
++
++`.env` solo lo usa el código heredado de Binance; el flujo con MT5 no lo necesita. Nunca se sube al repo.
++
++## Verificaciones (sin MT5, con datos sintéticos)
++
+ ```bash
+-python execution/multi_tp_monitor.py
++python tests/verify_engine.py               # motor de backtest: regresión y casos con resultado conocido
++python tests/verify_exits_and_selection.py  # monitor (SL escalonado / trailing) y selección de órdenes con un MT5 simulado
++python tests/verify_scan_smoke.py           # escaneo completo del universo, de punta a punta
+ ```
+ 
+-## ⚙️ Configuración
+-Los parámetros globales (umbrales de ADX, pesos de estrategias, riesgo base por categoría) se encuentran en `config/settings.py`.
++## Limitaciones conocidas
++
++Medido el 2026-10-06 con datos sintéticos y con las lecturas reales de los scans:
++
++1. **Régimen sesgado.** Con ventana de 100 velas y lags hasta 49, el Hurst de un random walk sintético sale ≈ 0.35 (debería ser ≈ 0.5) y el 79% se etiqueta RANGING. En RANGING los pesos pasan a 0.2 tendencia / 0.8 momentum. No está validado con backtest.
++2. **Momentum con escala de cripto.** La fuerza es `min(|ROC%| / 10, 1)`: en cripto satura, en forex rara vez pasa de 0.4. Con umbral 0.6, el forex casi nunca califica.
++3. **Señal parcial limitada.** Una sola estrategia activa tiene tope 0.6, así que solo pasa el umbral si satura en 1.0.
++4. **Backtest acotado.** Solo trend following en EURUSD con el perfil anterior (SL 1.5 / TP 4.5 ATR; 3 años, H1, sin fricción): profit factor 1.12 in-sample y 1.39 out-of-sample, win rate 27–32%, 273 trades, drawdown máximo −24R in-sample. No cubre confluencia, régimen, la salida escalonada ni otros símbolos.
++5. **Trailing casi inerte.** Con el TP final a 1.5R, el trailing de 2×ATR no supera al SL escalonado antes de que la orden cierre en el TP.
++6. **Correlación.** Con `MAX_TRADES_PER_CATEGORY` alto pueden abrirse varias posiciones cripto que son casi una sola apuesta.
++7. **Capital pequeño.** Con $50, el lote mínimo de BTCUSD arriesgaba ~13% con el SL anterior (1.5 ATR); con SL 1.0 ATR baja a ~9% y el tope del 3% lo sigue omitiendo.
++8. **Perfil corto sin validar.** En un mercado sin ventaja (random walk simulado), un TP a 4.5 ATR se alcanza en ≤ 5 h el 0.7% de las veces y uno a 1.5 ATR el ~31% (con SL 1.0). Con SL 1.0 / TP 1.5 hace falta ganar ≥ 40% de los trades para no perder, y el spread pesa más cuanto más cerca está el TP. Medir con `backtest.sweep_exits` antes de confiar.
++
++## Colaboración
++
++- `CLAUDE.md`: reglas de trabajo para Claude Code.
++- `docs/TAREAS_CLAUDE_CODE.md`: tareas pendientes por fases, decisiones ya tomadas y lecciones técnicas.
++- `CHANGELOG.md`: registro de cambios (fecha, quién, archivos y motivo).
++- `tools/export_snapshot.sh`: genera `snapshot.md` con el estado del proyecto para compartirlo en otros chats.
+diff --git a/backtest/engine.py b/backtest/engine.py
+index f062499..f6ea609 100644
+--- a/backtest/engine.py
++++ b/backtest/engine.py
+@@ -1,17 +1,20 @@
+ """
+ Motor de backtest para la estrategia de trend following multi-timeframe.
+ Simula entradas en señales de confluencia (D1+H4+H1 alineados), con
+-stop loss basado en ATR y ratio riesgo:beneficio 1:3, con cierre
++stop loss y take profit en múltiplos de ATR (ver config/settings.py), con cierre
+ anticipado si aparece señal contraria.
+ """
+ import pandas as pd
+ import numpy as np
+ 
+ from indicators.trend import calculate_trend_series, calculate_atr
+-from config.settings import TIMEFRAMES, ADX_THRESHOLD
++from config.settings import (
++    TIMEFRAMES, ADX_THRESHOLD, SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER, MULTI_TP_LEVELS,
++)
+ 
+-RISK_REWARD_RATIO = 3.0
+-ATR_SL_MULTIPLIER = 1.5  # SL a 1.5x ATR de distancia
++# Se derivan de config/settings.py para que scanner y backtest usen siempre las mismas distancias
++ATR_SL_MULTIPLIER = SL_ATR_MULTIPLIER                        # SL a N x ATR
++RISK_REWARD_RATIO = TP_ATR_MULTIPLIER / SL_ATR_MULTIPLIER    # TP final en múltiplos del riesgo
+ 
+ 
+ def align_multi_timeframe(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame) -> pd.DataFrame:
+@@ -53,83 +56,95 @@ def generate_signals(merged: pd.DataFrame) -> pd.DataFrame:
+     return merged
+ 
+ 
+-def simulate_trades(merged: pd.DataFrame) -> pd.DataFrame:
++def simulate_trades(merged: pd.DataFrame, sl_mult=None, tp_mult=None,
++                    max_hold_bars=None, ladder=False, cost_atr=0.0) -> pd.DataFrame:
+     """
+     Simula trades: entra en la primera vela con señal (si no hay posición
+-    abierta), sale por SL, TP, o señal contraria. Un trade a la vez.
+-
+-    PnL expresado en R-múltiplos (1R = riesgo asumido en el stop loss).
++    abierta), sale por SL, TP, señal contraria o (opcional) límite de tiempo.
++    Un trade a la vez. PnL en R-múltiplos (1R = riesgo inicial del stop).
++
++    sl_mult / tp_mult: distancias en múltiplos de ATR (por defecto, las de settings).
++    max_hold_bars:     cierra a mercado tras N velas H1 (ej. 5 = "4 o 5 horas").
++    ladder:            aplica el SL escalonado (TP1 -> breakeven, TP2 -> SL en TP1).
++                       El SL nuevo rige desde la vela siguiente (sin look-ahead).
++    cost_atr:          costo por trade (spread + deslizamiento) en múltiplos de ATR.
+     """
++    sl_mult = ATR_SL_MULTIPLIER if sl_mult is None else sl_mult
++    tp_mult = TP_ATR_MULTIPLIER if tp_mult is None else tp_mult
++    lvl1, lvl2 = MULTI_TP_LEVELS[0][0], MULTI_TP_LEVELS[1][0]
++
++    times = merged["time"].to_numpy()
++    highs = merged["high"].to_numpy(float)
++    lows = merged["low"].to_numpy(float)
++    closes = merged["close"].to_numpy(float)
++    atrs = merged["atr"].to_numpy(float)
++    signals = merged["signal"].to_numpy()
++
+     trades = []
+     in_position = False
+-    direction = None
+-    entry_price = None
+-    sl_price = None
+-    tp_price = None
+-    entry_time = None
++    entry_i = sign = entry = sl0 = sl = tp = risk0 = atr = None
+ 
+     for i in range(1, len(merged)):
+-        row = merged.iloc[i]
+-
+         if not in_position:
+-            if row["signal"] in ("alcista", "bajista") and not pd.isna(row["atr"]):
+-                direction = row["signal"]
+-                entry_price = row["close"]
+-                atr = row["atr"]
+-
+-                if direction == "alcista":
+-                    sl_price = entry_price - atr * ATR_SL_MULTIPLIER
+-                    tp_price = entry_price + atr * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO
+-                else:
+-                    sl_price = entry_price + atr * ATR_SL_MULTIPLIER
+-                    tp_price = entry_price - atr * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO
+-
+-                entry_time = row["time"]
++            if signals[i] in ("alcista", "bajista") and not np.isnan(atrs[i]):
++                sign = 1 if signals[i] == "alcista" else -1
++                entry = closes[i]
++                atr = atrs[i]
++                risk0 = atr * sl_mult
++                sl0 = sl = entry - sign * risk0
++                tp = entry + sign * atr * tp_mult
++                entry_i = i
+                 in_position = True
++            continue
++
++        if sign == 1:
++            hit_sl, hit_tp, contra = lows[i] <= sl, highs[i] >= tp, signals[i] == "bajista"
+         else:
+-            exit_reason = None
+-            exit_price = None
+-
+-            if direction == "alcista":
+-                if row["low"] <= sl_price:
+-                    exit_reason, exit_price = "SL", sl_price
+-                elif row["high"] >= tp_price:
+-                    exit_reason, exit_price = "TP", tp_price
+-                elif row["signal"] == "bajista":
+-                    exit_reason, exit_price = "señal_contraria", row["close"]
+-            else:
+-                if row["high"] >= sl_price:
+-                    exit_reason, exit_price = "SL", sl_price
+-                elif row["low"] <= tp_price:
+-                    exit_reason, exit_price = "TP", tp_price
+-                elif row["signal"] == "alcista":
+-                    exit_reason, exit_price = "señal_contraria", row["close"]
+-
+-            if exit_reason:
+-                risk = abs(entry_price - sl_price)
+-                raw_pnl = (exit_price - entry_price) if direction == "alcista" else (entry_price - exit_price)
+-                pnl_r = raw_pnl / risk if risk > 0 else 0
+-
+-                trades.append({
+-                    "entry_time": entry_time,
+-                    "exit_time": row["time"],
+-                    "direction": direction,
+-                    "entry_price": entry_price,
+-                    "exit_price": exit_price,
+-                    "exit_reason": exit_reason,
+-                    "pnl": round(pnl_r, 3),
+-                })
+-                in_position = False
++            hit_sl, hit_tp, contra = highs[i] >= sl, lows[i] <= tp, signals[i] == "alcista"
++
++        reason = exit_price = None
++        if hit_sl:
++            reason, exit_price = ("SL" if sl == sl0 else "SL_escalonado"), sl
++        elif hit_tp:
++            reason, exit_price = "TP", tp
++        elif contra:
++            reason, exit_price = "señal_contraria", closes[i]
++        elif max_hold_bars is not None and i - entry_i >= max_hold_bars:
++            reason, exit_price = "tiempo", closes[i]
++
++        if reason:
++            raw_pnl = (exit_price - entry) * sign
++            pnl_r = (raw_pnl - cost_atr * atr) / risk0 if risk0 > 0 else 0
++            trades.append({
++                "entry_time": times[entry_i],
++                "exit_time": times[i],
++                "direction": "alcista" if sign == 1 else "bajista",
++                "entry_price": entry,
++                "exit_price": exit_price,
++                "exit_reason": reason,
++                "bars_held": i - entry_i,
++                "pnl": round(float(pnl_r), 3),
++            })
++            in_position = False
++        elif ladder:
++            favorable = (highs[i] - entry) if sign == 1 else (entry - lows[i])
++            new_sl = None
++            if favorable >= lvl2 * risk0:
++                new_sl = entry + sign * lvl1 * risk0
++            elif favorable >= lvl1 * risk0:
++                new_sl = entry
++            if new_sl is not None and ((sign == 1 and new_sl > sl) or (sign == -1 and new_sl < sl)):
++                sl = new_sl
+ 
+     return pd.DataFrame(trades)
+ 
+ 
+-def run_backtest(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame) -> pd.DataFrame:
+-    """Pipeline completo: alinea timeframes, genera señales, simula trades."""
++def run_backtest(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame, **exit_params) -> pd.DataFrame:
++    """Pipeline completo: alinea timeframes, genera señales, simula trades.
++    exit_params se pasa a simulate_trades (sl_mult, tp_mult, max_hold_bars, ladder, cost_atr)."""
+     merged = align_multi_timeframe(df_bias, df_confirm, df_entry)
+     merged = generate_signals(merged)
+-    trades = simulate_trades(merged)
+-    return trades
++    return simulate_trades(merged, **exit_params)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backtest/sweep_exits.py b/backtest/sweep_exits.py
+new file mode 100644
+index 0000000..6919179
+--- /dev/null
++++ b/backtest/sweep_exits.py
+@@ -0,0 +1,88 @@
++"""
++Barrido de perfiles de salida sobre datos reales de MT5 (SL y TP en múltiplos de ATR(H1)).
++
++Uso (desde la raíz, con MT5 y el servidor mt5linux corriendo):
++    python -m backtest.sweep_exits                    # EURUSD
++    python -m backtest.sweep_exits EURUSD GBPUSD BTCUSD
++
++Compara, por símbolo:
++  - SL en {0.75, 1.0, 1.5} ATR y TP en {1.0, 1.5, 2.0, 3.0, 4.5} ATR
++  - con y sin SL escalonado (TP1 -> breakeven, TP2 -> SL en TP1)
++  - con y sin límite de 5 horas (cierra a mercado)
++Los resultados van en R (1R = lo que se arriesga). "Con costo" resta 0.05 ATR por trade
++(spread + deslizamiento); con objetivos cortos el costo pesa mucho más.
++"""
++import itertools
++import sys
++
++import pandas as pd
++
++from data.fetch_mt5 import fetch_mt5_candles
++from backtest.engine import align_multi_timeframe, generate_signals, simulate_trades
++
++SL_GRID = [0.75, 1.0, 1.5]
++TP_GRID = [1.0, 1.5, 2.0, 3.0, 4.5]
++HOLD_BARS = 5          # "4 o 5 horas" en velas H1
++COST_ATR = 0.05
++MIN_TRADES = 30        # con menos trades el profit factor no significa nada
++
++
++def profit_factor(pnl: pd.Series) -> float:
++    wins, losses = pnl[pnl > 0].sum(), -pnl[pnl <= 0].sum()
++    return float(wins / losses) if losses > 0 else float("inf")
++
++
++def evaluate(trades: pd.DataFrame, sl: float, tp: float, ladder: bool, hold) -> dict:
++    cost_r = COST_ATR / sl                       # costo por trade expresado en R
++    pnl_cost = trades["pnl"] - cost_r
++    split = int(len(trades) * 0.7)
++    return {
++        "SL": sl, "TP": tp,
++        "escalonado": "sí" if ladder else "no",
++        "límite 5h": "sí" if hold else "no",
++        "trades": len(trades),
++        "TP≤5h %": round(100 * ((trades["exit_reason"] == "TP") & (trades["bars_held"] <= HOLD_BARS)).mean(), 1),
++        "horas medias": round(float(trades["bars_held"].mean()), 1),
++        "PF sin costo": round(profit_factor(trades["pnl"]), 2),
++        "PF con costo": round(profit_factor(pnl_cost), 2),
++        "PF 30% final": round(profit_factor(pnl_cost.iloc[split:]), 2),
++        "neto R": round(float(pnl_cost.sum()), 1),
++    }
++
++
++def run_symbol(symbol: str) -> pd.DataFrame:
++    print(f"\n{'=' * 78}\n{symbol}: descargando histórico...")
++    d1 = fetch_mt5_candles(symbol, "D1", 1000)
++    h4 = fetch_mt5_candles(symbol, "H4", 5000)
++    h1 = fetch_mt5_candles(symbol, "H1", 20000)
++    merged = generate_signals(align_multi_timeframe(d1, h4, h1))
++
++    rows = []
++    for sl, tp, ladder, hold in itertools.product(SL_GRID, TP_GRID, [False, True], [None, HOLD_BARS]):
++        trades = simulate_trades(merged, sl_mult=sl, tp_mult=tp, ladder=ladder, max_hold_bars=hold)
++        if len(trades) >= 2:
++            rows.append(evaluate(trades, sl, tp, ladder, hold))
++    return pd.DataFrame(rows)
++
++
++def show(symbol: str, df: pd.DataFrame):
++    valid = df[df["trades"] >= MIN_TRADES].sort_values("PF con costo", ascending=False)
++    print(f"\n{symbol}: mejores 12 combinaciones (mínimo {MIN_TRADES} trades), ordenadas por PF con costo")
++    print(valid.head(12).to_string(index=False))
++
++    def ref(sl, tp, ladder, hold):
++        m = df[(df.SL == sl) & (df.TP == tp) & (df.escalonado == ("sí" if ladder else "no")) & (df["límite 5h"] == ("sí" if hold else "no"))]
++        return m
++    print(f"\n{symbol}: perfiles de referencia")
++    print(pd.concat([ref(1.5, 4.5, False, None).assign(perfil="anterior (1.5 / 4.5)"),
++                     ref(1.0, 1.5, True, None).assign(perfil="corto (1.0 / 1.5, escalonado)"),
++                     ref(1.0, 1.5, True, HOLD_BARS).assign(perfil="corto + límite 5 h")]).to_string(index=False))
++
++
++if __name__ == "__main__":
++    symbols = sys.argv[1:] or ["EURUSD"]
++    for s in symbols:
++        show(s, run_symbol(s))
++    print("\nNotas: (1) los resultados están en R y los parámetros ganadores se eligen mirando el mismo histórico; "
++          "confirma con la columna 'PF 30% final'. (2) Menos de 30 trades no se muestra: no es una muestra. "
++          "(3) Con PF con costo < 1 el perfil pierde dinero una vez descontado el spread.")
+diff --git a/config/settings.py b/config/settings.py
+index d140a80..401abf4 100644
+--- a/config/settings.py
++++ b/config/settings.py
+@@ -71,15 +71,28 @@ MAX_TRADES_PER_CATEGORY = 5     # máximo de trades simultáneos por categoría
+ 
+ ACCOUNT_LEVERAGE_CAP = 1.0      # apalancamiento máximo (techo, no objetivo)
+ 
+-# --- Take profits escalonados (múltiplo de riesgo, fracción a cerrar) ---
++# --- Distancia de SL y TP final, en múltiplos del ATR de H1 ---
++# Perfil corto (objetivo alcanzable en ~4-5 horas): SL 1.0 / TP 1.5.
++# Perfil anterior (swing de varios días):          SL 1.5 / TP 4.5.
++SL_ATR_MULTIPLIER = 1.0
++TP_ATR_MULTIPLIER = 1.5
++
++# --- SL escalonado (múltiplos del riesgo inicial). El tercer valor es el TP final y se deriva de arriba ---
+ MULTI_TP_LEVELS = [
+-    (0.5, 0.33),   # TP1: 0.5x el riesgo, cierra 33%
+-    (1.0, 0.33),   # TP2: 1.0x el riesgo, cierra 33%
+-    (3.0, 0.34),   # TP3: 3.0x el riesgo, cierra el resto (34%)
++    (0.5, 0.33),   # TP1: el SL pasa a breakeven
++    (1.0, 0.33),   # TP2: el SL pasa al nivel de TP1
++    (TP_ATR_MULTIPLIER / SL_ATR_MULTIPLIER, 0.34),   # TP final (va dentro de la orden)
+ ]
+ 
+-ATR_TRAILING_MULTIPLIER = 2.0  # Multiplicador para el Trailing Stop basado en ATR
+-
+ # Capital operativo para calcular riesgo. None = usa el balance real de la cuenta.
+ # Ej.: 50.0 para simular una cuenta de $50 sobre la demo de $500.
+ OPERATING_CAPITAL = None
++
++# --- Lote y tope de riesgo con lote fijo ---
++# Lote fijo por operación (None = calcular el lote según el riesgo y la fuerza de la señal)
++FIXED_LOT = 0.01
++# Tope de riesgo real por trade con lote fijo, como fracción del capital operativo (None = sin tope)
++MAX_RISK_PER_TRADE_PCT = 0.03
++
++# --- Salida de posiciones (monitor): SL escalonado + trailing por ATR tras TP2 ---
++ATR_TRAILING_MULTIPLIER = 2.0
+diff --git a/docs/TAREAS_CLAUDE_CODE.md b/docs/TAREAS_CLAUDE_CODE.md
+new file mode 100644
+index 0000000..c452f01
+--- /dev/null
++++ b/docs/TAREAS_CLAUDE_CODE.md
+@@ -0,0 +1,107 @@
++# Tareas pendientes para Claude Code
++
++Trabaja por fases, en orden. Lee primero `CLAUDE.md`, `README.md` (sobre todo "Limitaciones conocidas") y `CHANGELOG.md`.
++
++## Reglas de trabajo
++
++1. Después de cada tarea: corre las verificaciones, agrega una entrada a `CHANGELOG.md` (fecha, qué y por qué), actualiza `README.md` si cambia el comportamiento y haz **un commit por tarea** con mensaje claro. Haz push al terminar cada fase.
++2. Antes y después de cada fase corre, desde la raíz: `python tests/verify_engine.py`, `python tests/verify_exits_and_selection.py` y `python tests/verify_scan_smoke.py`. Deben dar todo OK.
++3. Cuenta **demo**. Nunca leas, muestres ni subas `.env`. No reintroduzcas Binance/OANDA en el flujo.
++4. Todo cambio que altere **qué se opera** (pesos, umbral, límites, SL/TP) va detrás de una bandera en `config/settings.py` y con evidencia de backtest (números antes y después). El valor por defecto solo cambia si la evidencia lo respalda, y lo dices en el resumen de la fase. Si dudas, para y pregunta.
++5. No cambies `CONFLUENCE_THRESHOLD` "para ver más trades". Si hace falta explorarlo, es un experimento de backtest, no un cambio de default.
++6. Al final de cada fase entrega un resumen con: qué hiciste, cómo lo verificaste (comandos y resultado), números de backtest y qué queda pendiente o necesita mi decisión.
++
++## Decisiones ya tomadas (no cambiar sin preguntarme)
++
++- Todo por Exness/MT5 en cuenta demo; símbolos con sufijo `m`. Universo: 5 cripto (BTC, ETH, BNB, SOL, XRP), 10 forex, XAUUSD, USOIL, XNGUSD, US500, USTEC, US30, UK100.
++- Señales: trend following multi-timeframe (D1 sesgo, H4 confirmación, H1 entrada; EMA 20/50 + ADX 14 ≥ 20) y momentum (ROC 20/60/120), combinados por confluencia con umbral 0.6.
++- Se analiza todo el universo y luego se elige; si una orden falla se prueba la siguiente; un cupo solo se consume si la orden se ejecuta. Ciclo cada 15 min; monitor cada 30 s; un solo comando: `python -m scanner.run_all`.
++- Ejecución automática con SL y TP dentro de la orden. **Lote fijo 0.01** con tope de riesgo por trade (`MAX_RISK_PER_TRADE_PCT`).
++- Salida: SL escalonado (TP1 = 0.5R → breakeven; TP2 = 1R → SL en TP1) + trailing por ATR tras TP2. Sin cierres parciales (0.01 lotes no se divide). **No sustituyas `multi_tp_monitor.py` por un trailing puro.**
++- Objetivo de duración: TP alcanzable en ~4–5 horas y, como máximo, 100–300 puntos. Perfil actual SL 1.0 / TP 1.5 ATR(H1), **sin validar**.
++- Capital objetivo real: $50 (la demo tiene $500). Límites originalmente acordados: máx. 2 trades por categoría y 3% de riesgo agregado.
++
++## Lecciones técnicas (no las rompas otra vez)
++
++- `mt5linux`: pasa `float` nativos a `order_send` (un `numpy.float64` rompe la serialización). `copy_rates_range` falla: usa `copy_rates_from_pos` con N grande.
++- `fetch_mt5_candles` agrega el sufijo `m`: pásale el símbolo estándar. Las posiciones de MT5 ya traen el símbolo con `m` (`ETHUSDm`).
++- Retcodes vistos: 10018 mercado cerrado (forex en fin de semana), 10017 trading deshabilitado en ese símbolo (SOL/BNB/XRP en la demo), 10027 AutoTrading desactivado, 10016 stops inválidos, 10030 modo de llenado no soportado.
++- AutoTrading debe estar activo en MT5 (se desactiva al reiniciarlo). Scripts siempre desde la raíz con `python -m ...`. El servidor `mt5linux` corre por Wine en el puerto 18812 y el terminal MT5 debe estar abierto y con sesión.
++- Los hilos de `run_all.py` son `daemon` y hoy mueren en silencio si lanzan excepción.
++
++---
++
++## FASE 0 — Reconciliar el estado
++
++Compara `git status`, `git log` y el contenido real con lo descrito aquí.
++
++- Si existe `backtest/sweep_exits.py` y `config/settings.py` define `SL_ATR_MULTIPLIER`, el parche `todo-junto.patch` ya está aplicado: solo falta commit y push de lo que falte.
++- Si no, aplícalo (`git apply --check` primero). Si hay conflictos, conserva SIEMPRE: el monitor combinado (SL escalonado + trailing con bucle `run_monitor()`), `FIXED_LOT`, `MAX_RISK_PER_TRADE_PCT`, `SL_ATR_MULTIPLIER`/`TP_ATR_MULTIPLIER` y `CONFLUENCE_THRESHOLD = 0.6`.
++- Verifica que `python -m scanner.run_all` importa sin errores y que el monitor **corre en bucle** (la versión anterior hacía una sola pasada y terminaba).
++
++## FASE 1 — Red de seguridad y medición (antes de cambiar nada)
++
++1.1 **Suite pytest.** Convierte `tests/verify_*.py` a pytest conservando todos los escenarios, y agrega pruebas de: límites de `RiskEngine`, `confluence/scorer.py`, `position_tracker`. *Criterio:* `pytest` en verde.
++
++1.2 **Modo `--dry-run`** en `run_live` y `run_all`: calcula y registra todo lo que haría sin llamar a `order_send`. *Criterio:* una prueba confirma que no se envía ninguna orden.
++
++1.3 **Costos reales.** Lee el spread de cada símbolo (y comisión si aplica) y úsalo en el backtest (costo en R por símbolo) y como filtro en vivo `MAX_SPREAD_FRACTION_OF_TP` (omite la candidata si el spread supera esa fracción del TP, mostrando el motivo). Propón el valor por defecto a partir de datos. *Criterio:* el backtest reporta con y sin costos reales.
++
++1.4 **Backtest de la estrategia completa.** Hoy solo cubre trend following en EURUSD. Reutiliza el MISMO código del vivo (strategies, scorer, regime) en vez de copiarlo; que cubra todo el universo; con costos; in-sample/out-of-sample y walk-forward. Compara cuatro configuraciones: (a) solo trend following, (b) trend + momentum con pesos fijos 0.6/0.4, (c) con la capa de régimen actual, (d) con el régimen corregido (cuando exista, ver 2.1). Guarda resultados en `reports/`. *Criterio:* tabla con profit factor, win rate, drawdown máximo en R, nº de trades y desglose por categoría.
++
++1.5 **Barrido de salidas con datos reales.** Ejecuta `python -m backtest.sweep_exits` (MT5 abierto) en EURUSD, GBPUSD, USDJPY, XAUUSD, BTCUSD y US500. Reporta el mejor perfil por categoría con su profit factor fuera de muestra y con costos. **No cambies los defaults solo con esto:** propón y espera mi decisión.
++
++## FASE 2 — Correcciones de la capa de señales (detrás de banderas)
++
++2.1 **Régimen.** Mediciones previas: con ventana de 100 velas y lags hasta 49, un random walk sintético sale con Hurst ≈ 0.35 y se etiqueta 79% RANGING; las series con tendencia, 73% RANGING. Agrega la bandera `USE_REGIME_WEIGHTS` (default `False`). Corrige el estimador (ventana ≥ 400, lags máx. ~20) o sustitúyelo (variance ratio, DFA o Efficiency Ratio de Kaufman). Evalúalo con series sintéticas (random walk, persistente, anti-persistente) midiendo la tasa de error, y con el backtest A/B de 1.4. En RANGING no le des 80% de peso al momentum: es una estrategia de continuación. *Criterio:* tasa de error documentada y claramente menor que la actual; si no se logra, deja la capa desactivada y documéntalo.
++
++2.2 **Momentum comparable entre categorías.** La fuerza actual es `min(|ROC%|/10, 1)`: satura en cripto y casi nunca pasa de 0.4 en forex, así que el forex casi nunca califica. Normaliza por categoría (ranking dentro de la categoría, o ROC / volatilidad) con la bandera `MOMENTUM_NORMALIZATION = "category" | "legacy"`. *Criterio:* medianas de fuerza similares por categoría y un scan con datos reales donde el forex pueda calificar cuando corresponda.
++
++2.3 **Señal parcial.** Una sola estrategia activa multiplica el score por 0.6 y el umbral es 0.6, así que solo pasa cuando satura. Rediséñalo (umbral relativo o penalización distinta) con evidencia de backtest.
++
++2.4 **Límites de riesgo.** Restaura `MAX_TRADES_PER_CATEGORY = 2` y `MAX_AGGREGATE_RISK = 0.03` (valores acordados; Claude Code los había subido a 5 y 5%). Agrega un límite por correlación (`MAX_CORRELATED_SAME_DIRECTION`: máx. N posiciones en la misma dirección dentro de un grupo correlacionado, estimado con correlación rolling de retornos H1). *Criterio:* pruebas.
++
++2.5 **Herramienta de capital.** `tools/min_risk_report.py`: para cada símbolo, el riesgo en dinero y en % que implica el lote mínimo con el SL vigente, y qué símbolos pasan el tope con capital de $50, $100 y $500. *Criterio:* tabla impresa.
++
++## FASE 3 — Protecciones para operar en automático
++
++3.1 **Circuit breaker** (`risk/circuit_breaker.py`): pérdida diaria máxima, pérdida semanal máxima (el plan original era 4× el riesgo por operación) y N pérdidas consecutivas, tras lo cual no se abren posiciones nuevas hasta el siguiente periodo. Estado persistente y calculado desde `history_deals_get` de MT5. Parámetros en settings. *Criterio:* pruebas con MT5 simulado y mensaje claro en el ciclo.
++
++3.2 **Verificación de arranque** en `run_all`: AutoTrading activo (`terminal_info().trade_allowed`) y cuenta **demo**. Si es cuenta real, aborta salvo `ALLOW_LIVE_ACCOUNT = True` (default `False`).
++
++3.3 **Resiliencia de `run_all`:** reinicia el scanner o el monitor si su hilo muere por excepción (con límite de reintentos y log) y que `start_mt5.sh` no tenga rutas fijas de usuario.
++
++3.4 **Mercado cerrado:** detecta sesión cerrada (ticks desactualizados / `trade_mode`) antes de enviar órdenes, en lugar de depender del retcode 10018.
++
++3.5 **Reconciliación al arrancar:** posiciones abiertas sin registro en `position_tracker` (manuales o previas) se registran con su riesgo original si tienen SL, o se marcan "no gestionadas"; limpia los tickets cerrados.
++
++## FASE 4 — Registro y seguimiento
++
++4.1 **Diario** en SQLite o CSV dentro de `logs/` (ignorado por git): por ciclo (señales, régimen, scores, candidatas, decisión y motivo), por orden (precio pedido vs. llenado, spread) y por cierre (motivo, R realizado, horas abierta).
++
++4.2 **`tools/report_live.py`:** resumen diario/semanal con nº de trades, win rate, profit factor, R neto, horas medias hasta el TP, % que llegó al TP en ≤ 5 h y comparación con el backtest.
++
++## FASE 5 — Más estrategias (solo con la Fase 1 terminada)
++
++5.1 **Registro de estrategias** (`strategies/registry.py`): `scan_category` y el scorer no deben nombrar estrategias; agregar una = una clase + su peso en settings. *Criterio:* mover trend y momentum al registro sin cambiar resultados (las verificaciones siguen igual).
++
++5.2 **Mean reversion** (RSI(2), Bollinger o Connors en H1, con filtro de tendencia de un timeframe mayor), pensada para objetivos de 4–5 h. Bandera `ENABLE_MEAN_REVERSION = False`. Solo se activa si el profit factor fuera de muestra y con costos es > 1 en varios símbolos.
++
++5.3 **Variante rápida de trend following** (H4 sesgo, H1 confirmación, M15 entrada) como experimento para horizontes de 4–5 h; compárala con la actual usando el barrido.
++
++5.4 **Pairs / stat arb:** solo evaluar viabilidad (cointegración de pares correlacionados en H1) y reportar. No implementes la ejecución sin mi aprobación (requiere dos patas).
++
++5.5 **Filtro de EMA 200** como componente opcional de confirmación. Volume Profile: descártalo salvo que muestres que el volumen de tick del CFD aporta información.
++
++## FASE 6 — Limpieza
++
++6.1 Mueve el código heredado (Binance/OANDA) a `legacy/` o elimínalo, y actualiza `requirements.txt` y el README.
++6.2 Quita `signals/` y `.vscode/` del repo y ajusta `.gitignore` (`logs/`, `reports/` si procede).
++6.3 Mantén `README.md` y `CHANGELOG.md` al día.
++
++## No hacer
++
++- No subir el lote ni quitar el tope `MAX_RISK_PER_TRADE_PCT`.
++- No operar en cuenta real.
++- No cambiar la lógica del monitor sin evidencia.
++- No dar por buena una estrategia con menos de ~30 trades ni sin resultados fuera de muestra y con costos.
+diff --git a/execution/mt5_executor.py b/execution/mt5_executor.py
+index ef2ba5f..5b1e0ed 100644
+--- a/execution/mt5_executor.py
++++ b/execution/mt5_executor.py
+@@ -115,37 +115,56 @@ def close_mt5_position(ticket: int) -> dict:
+     return {"success": True, "ticket": ticket}
+ 
+ 
++def _send_with_fill_fallback(mt5, base_request: dict):
++    """Prueba varios modos de llenado; 10030 = modo no soportado por el símbolo."""
++    fillings = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
++    last = None
++    for filling in fillings:
++        request = dict(base_request)
++        request["type_filling"] = filling
++        result = mt5.order_send(request)
++        last = result
++        if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
++            return True, result
++        if result is not None and result.retcode != 10030:
++            break
++    return False, last
++
++
++def _describe_failure(mt5, result) -> str:
++    if result is not None:
++        return f"retcode={result.retcode}, comment={result.comment}"
++    return f"sin respuesta ({mt5.last_error()})"
++
++
+ def partial_close_position(ticket: int, volume_to_close: float) -> dict:
+     """Cierra una fracción del volumen de una posición abierta."""
+     mt5 = get_mt5_connection()
+     positions = mt5.positions_get(ticket=ticket)
+-
+     if not positions:
+         return {"success": False, "error": f"No se encontró posición con ticket {ticket}"}
+ 
+     pos = positions[0]
+     tick = mt5.symbol_info_tick(pos.symbol)
+-
+     close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+     price = float(tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask)
+ 
+-    request = {
++    base_request = {
+         "action": mt5.TRADE_ACTION_DEAL,
+         "symbol": pos.symbol,
+         "volume": float(round(volume_to_close, 2)),
+         "type": close_type,
+-        "position": ticket,
++        "position": int(ticket),
+         "price": price,
+         "deviation": 20,
+         "magic": 123456,
+         "comment": "cierre_parcial_tp",
+         "type_time": mt5.ORDER_TIME_GTC,
+-        "type_filling": mt5.ORDER_FILLING_IOC,
+     }
+ 
+-    result = mt5.order_send(request)
+-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+-        return {"success": False, "error": f"No se pudo cerrar parcialmente ticket {ticket}"}
++    ok, result = _send_with_fill_fallback(mt5, base_request)
++    if not ok:
++        return {"success": False, "error": f"cierre parcial ticket {ticket}: {_describe_failure(mt5, result)}"}
+ 
+     return {"success": True, "ticket": ticket, "volume_closed": volume_to_close}
+ 
+@@ -154,23 +173,21 @@ def modify_position_sl(ticket: int, new_sl: float) -> dict:
+     """Modifica el stop loss de una posición abierta (sin tocar el TP)."""
+     mt5 = get_mt5_connection()
+     positions = mt5.positions_get(ticket=ticket)
+-
+     if not positions:
+         return {"success": False, "error": f"No se encontró posición con ticket {ticket}"}
+ 
+     pos = positions[0]
+-
+     request = {
+         "action": mt5.TRADE_ACTION_SLTP,
+         "symbol": pos.symbol,
+-        "position": ticket,
++        "position": int(ticket),
+         "sl": float(round(new_sl, 5)),
+         "tp": float(pos.tp),
+     }
+ 
+     result = mt5.order_send(request)
+     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+-        return {"success": False, "error": f"No se pudo modificar SL de ticket {ticket}"}
++        return {"success": False, "error": f"modificar SL ticket {ticket}: {_describe_failure(mt5, result)}"}
+ 
+     return {"success": True, "ticket": ticket, "new_sl": new_sl}
+ 
+@@ -240,3 +257,56 @@ def estimate_position_open_risk(pos: dict) -> float:
+     if profit is None:
+         return 0.0
+     return max(0.0, -float(profit))
++
++
++def check_symbol_tradable(symbol: str, direction: str) -> tuple:
++    """Verifica que el broker permita operar el símbolo en esa dirección."""
++    mt5 = get_mt5_connection()
++    mt5_symbol = to_mt5_symbol(symbol)
++    mt5.symbol_select(mt5_symbol, True)
++    info = mt5.symbol_info(mt5_symbol)
++    if info is None:
++        return False, "símbolo no disponible en el broker"
++
++    mode = int(info.trade_mode)  # 0 deshabilitado, 1 solo compras, 2 solo ventas, 3 solo cierre, 4 completo
++    if mode == 4:
++        return True, "OK"
++    if mode == 1 and direction == "alcista":
++        return True, "OK"
++    if mode == 2 and direction == "bajista":
++        return True, "OK"
++
++    nombres = {0: "deshabilitado", 1: "solo compras", 2: "solo ventas", 3: "solo cierre"}
++    return False, f"trading {nombres.get(mode, mode)} en este símbolo"
++
++
++def calculate_fixed_volume(symbol: str, direction: str, entry_price: float,
++                           sl_price: float, fixed_lot: float) -> dict:
++    """Usa un lote fijo (ajustado a mínimo/paso/máximo) y calcula el riesgo real en dinero."""
++    import math
++    mt5 = get_mt5_connection()
++    mt5_symbol = to_mt5_symbol(symbol)
++    mt5.symbol_select(mt5_symbol, True)
++    info = mt5.symbol_info(mt5_symbol)
++    if info is None:
++        return {"volume": None, "reason": f"sin información del símbolo {mt5_symbol}"}
++
++    step, vmin, vmax = float(info.volume_step), float(info.volume_min), float(info.volume_max)
++    volume = math.floor(fixed_lot / step + 1e-9) * step
++    volume = round(max(vmin, min(vmax, volume)), 2)
++
++    order_type = mt5.ORDER_TYPE_BUY if direction == "alcista" else mt5.ORDER_TYPE_SELL
++    pnl = mt5.order_calc_profit(order_type, mt5_symbol, volume, float(entry_price), float(sl_price))
++    if pnl is None or pnl >= 0:
++        return {"volume": None, "reason": "no se pudo calcular el riesgo del lote"}
++
++    return {"volume": volume, "actual_risk": abs(float(pnl)), "reason": "OK"}
++
++
++def distance_in_points(symbol: str, price_distance: float):
++    """Convierte una distancia de precio a puntos del símbolo (1 punto = el mínimo movimiento de precio)."""
++    mt5 = get_mt5_connection()
++    info = mt5.symbol_info(to_mt5_symbol(symbol))
++    if info is None or not info.point:
++        return None
++    return int(round(abs(float(price_distance)) / float(info.point)))
+diff --git a/execution/multi_tp_monitor.py b/execution/multi_tp_monitor.py
+index 09f5647..465cb61 100644
+--- a/execution/multi_tp_monitor.py
++++ b/execution/multi_tp_monitor.py
+@@ -1,92 +1,127 @@
+ """
+-Monitor de Posiciones: Gestiona el seguimiento de trades abiertos,
+-implementando Trailing Stop basado en ATR y movimiento a Breakeven.
++Monitor de posiciones: SL escalonado + trailing por ATR.
++
++Para cada posición registrada por el scanner (usa el riesgo ORIGINAL guardado
++en position_tracker, nunca el SL actual):
++  - TP1 (0.5x el riesgo): SL a breakeven.
++  - TP2 (1.0x el riesgo): SL al precio de TP1.
++  - Después de TP2: trailing stop por ATR (H1). Solo sube en compras / solo baja
++    en ventas; nunca afloja el SL.
++El TP final (3x) sigue puesto en la orden original. No hace cierres parciales
++(con lote 0.01 no se puede dividir la posición).
+ """
+-import pandas as pd
+-import numpy as np
+-from data.fetch_mt5 import fetch_mt5_candles
++import time
++
++from config import settings
++from config.settings import MULTI_TP_LEVELS
++from data.fetch_mt5 import fetch_mt5_candles, get_mt5_connection
+ from indicators.trend import calculate_atr
+-from execution.mt5_executor import get_open_mt5_positions, modify_position_sl
+-from execution.position_tracker import get_position_state, get_all_tracked_tickets
+-from config.settings import ADX_THRESHOLD
+-try:
+-    from config.settings import ATR_TRAILING_MULTIPLIER
+-except ImportError:
+-    ATR_TRAILING_MULTIPLIER = 2.0
+-
+-# Configuración por defecto si no está en settings
+-DEFAULT_TRAILING_MULTIPLIER = 2.0
+-BREAKEVEN_RATIO = 1.0  # Mover a BE cuando el profit es 1x el riesgo original
++from execution.mt5_executor import modify_position_sl
++from execution.position_tracker import (
++    get_position_state, mark_tp_level_hit, remove_position, get_all_tracked_tickets,
++)
+ 
+-def run_monitor():
+-    """
+-    Función de entrada para el monitor.
+-    Llama a la actualización de stops.
+-    """
+-    update_trailing_stops()
+-
+-def update_trailing_stops():
+-    """
+-    Recorre todas las posiciones abiertas y ajusta el SL según el ATR y el precio actual.
+-    """
+-    print("Ejecutando actualización de Trailing Stops...")
+-
+-    # 1. Obtener posiciones reales de MT5
+-    positions = get_open_mt5_positions()
++ATR_TRAILING_MULTIPLIER = getattr(settings, "ATR_TRAILING_MULTIPLIER", 2.0)
++CHECK_INTERVAL_SECONDS = 30
++TRAILING_CANDLES = 100
++
++
++def standard_symbol(mt5_symbol: str) -> str:
++    # fetch_mt5_candles agrega el sufijo "m"; hay que pasarle el símbolo sin él
++    return mt5_symbol[:-1] if mt5_symbol.endswith("m") else mt5_symbol
++
++
++def level_price(direction: str, entry: float, risk: float, multiple: float) -> float:
++    d = risk * multiple
++    return entry + d if direction == "alcista" else entry - d
++
++
++def is_improvement(direction: str, current_sl: float, new_sl: float) -> bool:
++    if not current_sl:
++        return True
++    return new_sl > current_sl if direction == "alcista" else new_sl < current_sl
++
++
++def process_position(ticket):
++    tracked = get_position_state(int(ticket))
++    if tracked is None:
++        return
++
++    mt5 = get_mt5_connection()
++    positions = mt5.positions_get(ticket=int(ticket))
+     if not positions:
+-        print("No hay posiciones abiertas para monitorear.")
++        remove_position(int(ticket))  # cerrada por SL, TP final o manualmente
+         return
+ 
+-    for pos in positions:
+-        ticket = pos["ticket"]
+-        symbol = pos["symbol"]
+-        direction = "alcista" if pos["type"] == 0 else "bajista"
+-        current_sl = pos["sl"]
+-        entry_price = pos["price_open"]
++    pos = positions[0]
++    direction = tracked["direction"]
++    entry = tracked["entry_price"]
++    risk = tracked["risk_distance"]
++    levels_hit = list(tracked["tp_levels_hit"])
++    current_sl = float(pos.sl)
+ 
+-        # 2. Obtener datos para calcular ATR actual
+-        try:
+-            df = fetch_mt5_candles(symbol, "H1", 50)
+-            if df is None or df.empty:
+-                continue
+-
+-            atr = calculate_atr(df).iloc[-1]
+-            tick = get_mt5_connection().symbol_info_tick(symbol)
+-            current_price = tick.bid if direction == "alcista" else tick.ask
+-
+-            # 3. Lógica de Breakeven (Protección Inicial)
+-            # Calculamos la distancia de riesgo original
+-            risk_distance = abs(entry_price - current_sl) if current_sl != 0 else 0
+-            current_profit = abs(current_price - entry_price)
+-
+-            if current_sl != entry_price and current_profit >= risk_distance * BREAKEVEN_RATIO:
+-                # Mover a Breakeven si no se ha hecho ya
+-                print(f"  [BE] Moviendo ticket {ticket} ({symbol}) a Breakeven.")
+-                modify_position_sl(ticket, entry_price)
+-                continue
+-
+-            # 4. Lógica de Trailing Stop basado en ATR
+-            if direction == "alcista":
+-                # En compras, el SL solo puede SUBIR
+-                new_sl = current_price - (atr * DEFAULT_TRAILING_MULTIPLIER)
+-                if new_sl > current_sl:
+-                    print(f"  [TS] Subiendo SL de {symbol} (ticket {ticket}): {current_sl} -> {new_sl:.5f}")
+-                    modify_position_sl(ticket, new_sl)
+-            else:
+-                # En ventas, el SL solo puede BAJAR
+-                new_sl = current_price + (atr * DEFAULT_TRAILING_MULTIPLIER)
+-                if current_sl == 0 or new_sl < current_sl:
+-                    print(f"  [TS] Bajando SL de {symbol} (ticket {ticket}): {current_sl} -> {new_sl:.5f}")
+-                    modify_position_sl(ticket, new_sl)
++    tick = mt5.symbol_info_tick(pos.symbol)
++    if tick is None:
++        return
++    price = float(tick.bid if direction == "alcista" else tick.ask)
++
++    # 1) Niveles nuevos alcanzados (TP1 y TP2) -> SL escalonado
++    newly_hit = []
++    ladder_sl = None
++    for i in (0, 1):
++        if i in levels_hit:
++            continue
++        target = level_price(direction, entry, risk, MULTI_TP_LEVELS[i][0])
++        reached = price >= target if direction == "alcista" else price <= target
++        if not reached:
++            break
++        newly_hit.append(i)
++        ladder_sl = entry if i == 0 else level_price(direction, entry, risk, MULTI_TP_LEVELS[0][0])
++
++    # 2) Trailing por ATR, solo después de TP2
++    trailing_sl = None
++    if 1 in levels_hit or 1 in newly_hit:
++        df = fetch_mt5_candles(standard_symbol(pos.symbol), "H1", TRAILING_CANDLES)
++        atr = float(calculate_atr(df).iloc[-1])
++        if direction == "alcista":
++            trailing_sl = price - atr * ATR_TRAILING_MULTIPLIER
++        else:
++            trailing_sl = price + atr * ATR_TRAILING_MULTIPLIER
++
++    candidates = [c for c in (ladder_sl, trailing_sl) if c is not None]
++    if not candidates:
++        return
++    best_sl = max(candidates) if direction == "alcista" else min(candidates)
++
++    if is_improvement(direction, current_sl, best_sl):
++        result = modify_position_sl(int(ticket), best_sl)
++        if not result["success"]:
++            print(f"  [ERROR] {pos.symbol} ticket {ticket}: {result.get('error')} (se reintenta)")
++            return  # no se marcan los niveles; se reintenta en el próximo ciclo
++        etiqueta = "SL ESCALONADO" if newly_hit else "TRAILING"
++        niveles = ", ".join(f"TP{i + 1}" for i in newly_hit)
++        extra = f" tras {niveles}" if niveles else ""
++        print(f"  [{etiqueta}] {pos.symbol} ticket {ticket}{extra}: SL {current_sl} -> {round(best_sl, 5)}")
+ 
++    for i in newly_hit:
++        mark_tp_level_hit(int(ticket), i)
++
++
++def process_all_positions():
++    for ticket in get_all_tracked_tickets():
++        try:
++            process_position(ticket)
+         except Exception as e:
+-            print(f"  [ERROR] Fallo al actualizar stop para {symbol} (ticket {ticket}): {e}")
++            print(f"  [ERROR] procesando ticket {ticket}: {e}")
++
++
++def run_monitor():
++    print(f"Iniciando monitor de posiciones (cada {CHECK_INTERVAL_SECONDS}s | "
++          f"trailing {ATR_TRAILING_MULTIPLIER}x ATR después de TP2)")
++    while True:
++        process_all_positions()
++        time.sleep(CHECK_INTERVAL_SECONDS)
+ 
+-def get_mt5_connection():
+-    """Helper para obtener conexión en este módulo."""
+-    from data.fetch_mt5 import get_mt5_connection
+-    return get_mt5_connection()
+ 
+ if __name__ == "__main__":
+-    # Ejecución manual para test
+-    update_trailing_stops()
++    run_monitor()
+diff --git a/requirements.txt b/requirements.txt
+index e69de29..d919a3d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -0,0 +1,11 @@
++# Dependencias del scanner (Python 3.10, probado en Linux Mint).
++pandas
++numpy
++python-dotenv
++rpyc==5.0.1
++
++# mt5linux se instala APARTE y sin dependencias (su pin de numpy no funciona con pip moderno):
++#   pip install mt5linux==0.1.9 --no-deps
++
++# Solo para el código heredado de Binance (data/fetch_binance*.py, execution/binance_*), fuera del flujo actual:
++# python-binance
+diff --git a/scanner/run_live.py b/scanner/run_live.py
+index bb48619..0582c69 100644
+--- a/scanner/run_live.py
++++ b/scanner/run_live.py
+@@ -12,13 +12,14 @@ import traceback
+ 
+ from config.settings import (
+     FOREX_SYMBOLS, CRYPTO_SYMBOLS, COMMODITY_SYMBOLS, ETF_SYMBOLS,
+-    CONFLUENCE_THRESHOLD,
++    CONFLUENCE_THRESHOLD, FIXED_LOT, MAX_RISK_PER_TRADE_PCT,
+ )
+ from scanner.run_scan import run_full_scan
+ from risk.engine import RiskEngine
+ from execution.mt5_executor import (
+     execute_mt5_order, get_open_mt5_positions, get_effective_balance,
+     calculate_mt5_volume, estimate_position_open_risk,
++    calculate_fixed_volume, check_symbol_tradable, distance_in_points,
+ )
+ 
+ SCAN_INTERVAL_MINUTES = 15
+@@ -80,18 +81,42 @@ def select_and_execute(candidates, engine, open_symbols, balance):
+             print(f"  [YA ABIERTA] {symbol}")
+             continue
+ 
+-        risk_pct = engine.calculate_trade_risk_pct(category, row["strength"])
+-        can_open, reason = engine.can_open_trade(category, risk_pct)
+-        if not can_open:
+-            print(f"  [OMITIDO] {symbol}: {reason}")
++        tradable, why = check_symbol_tradable(symbol, direction)
++        if not tradable:
++            print(f"  [NO OPERABLE] {symbol}: {why}")
+             skipped.append(symbol)
+             continue
+ 
+-        sizing = calculate_mt5_volume(
+-            symbol, direction, row["entry_price"], row["sl_price"], balance * risk_pct
+-        )
+-        if sizing["volume"] is None:
+-            print(f"  [OMITIDO] {symbol}: {sizing['reason']}")
++        if FIXED_LOT is not None:
++            sizing = calculate_fixed_volume(
++                symbol, direction, row["entry_price"], row["sl_price"], FIXED_LOT
++            )
++            if sizing["volume"] is None:
++                print(f"  [OMITIDO] {symbol}: {sizing['reason']}")
++                skipped.append(symbol)
++                continue
++            risk_pct = sizing["actual_risk"] / balance
++            if MAX_RISK_PER_TRADE_PCT is not None and risk_pct > MAX_RISK_PER_TRADE_PCT:
++                print(
++                    f"  [OMITIDO] {symbol}: lote {sizing['volume']} arriesga "
++                    f"${sizing['actual_risk']:.2f} ({risk_pct:.1%}), tope {MAX_RISK_PER_TRADE_PCT:.1%}"
++                )
++                skipped.append(symbol)
++                continue
++        else:
++            risk_pct = engine.calculate_trade_risk_pct(category, row["strength"])
++            sizing = calculate_mt5_volume(
++                symbol, direction, row["entry_price"], row["sl_price"], balance * risk_pct
++            )
++            if sizing["volume"] is None:
++                print(f"  [OMITIDO] {symbol}: {sizing['reason']}")
++                skipped.append(symbol)
++                continue
++            risk_pct = sizing["actual_risk"] / balance
++
++        can_open, reason = engine.can_open_trade(category, risk_pct)
++        if not can_open:
++            print(f"  [OMITIDO] {symbol}: {reason}")
+             skipped.append(symbol)
+             continue
+ 
+@@ -101,10 +126,10 @@ def select_and_execute(candidates, engine, open_symbols, balance):
+         )
+ 
+         if result["success"]:
+-            engine.open_trade(symbol, category, direction, sizing["actual_risk"] / balance)
++            engine.open_trade(symbol, category, direction, risk_pct)
+             open_symbols.add(symbol)
+             executed.append(symbol)
+-            print(f"  [✓ EJECUTADO] {symbol} {direction} | lotes={sizing['volume']} | riesgo=${sizing['actual_risk']:.2f}")
++            print(f"  [EJECUTADO] {symbol} {direction} | lotes={sizing['volume']} | riesgo=${sizing['actual_risk']:.2f}")
+         else:
+             err = str(result.get("error", ""))
+             tag = "MERCADO CERRADO" if ("Market closed" in err or "10018" in err) else "FALLÓ"
+@@ -128,6 +153,12 @@ def run_one_cycle():
+         print("Sin señales en este ciclo.")
+         return
+ 
++    print("\nSeñales por categoría (todas, antes del umbral):")
++    for cat, grp in all_results.groupby("category"):
++        top = grp.sort_values("strength", ascending=False)
++        resumen = ", ".join(f"{r.symbol} {r.direction[:3]} {r.strength:.2f}" for r in top.itertuples())
++        print(f"  {cat}: {resumen}")
++
+     candidates = rank_candidates(all_results)
+     candidates = candidates[candidates["strength"] >= CONFLUENCE_THRESHOLD]
+ 
+@@ -135,8 +166,11 @@ def run_one_cycle():
+         print(f"{len(all_results)} señales, ninguna supera el umbral ({CONFLUENCE_THRESHOLD}).")
+         return
+ 
+-    print(f"\n{len(candidates)} candidata(s) en orden de prioridad:")
+-    print(candidates[["symbol", "category", "direction", "strength", "agreement"]].to_string(index=False))
++    candidates = candidates.copy()
++    candidates["sl_pts"] = [distance_in_points(r.symbol, r.entry_price - r.sl_price) for r in candidates.itertuples()]
++    candidates["tp_pts"] = [distance_in_points(r.symbol, r.tp_price - r.entry_price) for r in candidates.itertuples()]
++    print(f"\n{len(candidates)} candidata(s) en orden de prioridad (SL y TP en puntos):")
++    print(candidates[["symbol", "category", "direction", "strength", "agreement", "sl_pts", "tp_pts"]].to_string(index=False))
+ 
+     engine, open_symbols = build_engine_from_open_positions(balance)
+     print(f"\nPosiciones ya abiertas: {sorted(open_symbols) or 'ninguna'}")
+diff --git a/tests/_engine_old_reference.py b/tests/_engine_old_reference.py
+new file mode 100644
+index 0000000..39348ba
+--- /dev/null
++++ b/tests/_engine_old_reference.py
+@@ -0,0 +1,159 @@
++# Referencia congelada del motor de backtest ANTERIOR (SL 1.5 / TP 4.5 ATR), solo para la prueba de regresión en verify_engine.py. No modificar.
++"""
++Motor de backtest para la estrategia de trend following multi-timeframe.
++Simula entradas en señales de confluencia (D1+H4+H1 alineados), con
++stop loss basado en ATR y ratio riesgo:beneficio 1:3, con cierre
++anticipado si aparece señal contraria.
++"""
++import pandas as pd
++import numpy as np
++
++from indicators.trend import calculate_trend_series, calculate_atr
++from config.settings import TIMEFRAMES, ADX_THRESHOLD
++
++RISK_REWARD_RATIO = 3.0
++ATR_SL_MULTIPLIER = 1.5  # SL a 1.5x ATR de distancia
++
++
++def align_multi_timeframe(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame) -> pd.DataFrame:
++    """
++    Alinea las señales de D1 (bias), H4 (confirm) y H1 (entry) sobre la
++    línea de tiempo de H1 (el timeframe más rápido). Para cada vela H1,
++    usa la última señal D1/H4 ya *cerrada* en ese momento (evita look-ahead bias).
++    """
++    bias = calculate_trend_series(df_bias)[["time", "direction", "strength"]].rename(
++        columns={"direction": "bias_direction", "strength": "bias_strength"}
++    )
++    confirm = calculate_trend_series(df_confirm)[["time", "direction", "strength"]].rename(
++        columns={"direction": "confirm_direction", "strength": "confirm_strength"}
++    )
++    entry = calculate_trend_series(df_entry)
++    entry["atr"] = calculate_atr(entry)
++    entry = entry.rename(columns={"direction": "entry_direction", "strength": "entry_strength"})
++
++    # merge_asof: para cada timestamp de entry, toma el último bias/confirm
++    # con time <= ese timestamp (evita usar datos "del futuro")
++    entry = entry.sort_values("time")
++    bias = bias.sort_values("time")
++    confirm = confirm.sort_values("time")
++
++    merged = pd.merge_asof(entry, bias, on="time", direction="backward")
++    merged = pd.merge_asof(merged, confirm, on="time", direction="backward")
++
++    return merged
++
++
++def generate_signals(merged: pd.DataFrame) -> pd.DataFrame:
++    """Marca las filas donde los tres timeframes están alineados."""
++    aligned = (
++        (merged["bias_direction"] == merged["confirm_direction"])
++        & (merged["confirm_direction"] == merged["entry_direction"])
++        & (merged["bias_direction"] != "sin_tendencia")
++    )
++    merged["signal"] = np.where(aligned, merged["bias_direction"], "sin_senal")
++    return merged
++
++
++def simulate_trades(merged: pd.DataFrame) -> pd.DataFrame:
++    """
++    Simula trades: entra en la primera vela con señal (si no hay posición
++    abierta), sale por SL, TP, o señal contraria. Un trade a la vez.
++
++    PnL expresado en R-múltiplos (1R = riesgo asumido en el stop loss).
++    """
++    trades = []
++    in_position = False
++    direction = None
++    entry_price = None
++    sl_price = None
++    tp_price = None
++    entry_time = None
++
++    for i in range(1, len(merged)):
++        row = merged.iloc[i]
++
++        if not in_position:
++            if row["signal"] in ("alcista", "bajista") and not pd.isna(row["atr"]):
++                direction = row["signal"]
++                entry_price = row["close"]
++                atr = row["atr"]
++
++                if direction == "alcista":
++                    sl_price = entry_price - atr * ATR_SL_MULTIPLIER
++                    tp_price = entry_price + atr * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO
++                else:
++                    sl_price = entry_price + atr * ATR_SL_MULTIPLIER
++                    tp_price = entry_price - atr * ATR_SL_MULTIPLIER * RISK_REWARD_RATIO
++
++                entry_time = row["time"]
++                in_position = True
++        else:
++            exit_reason = None
++            exit_price = None
++
++            if direction == "alcista":
++                if row["low"] <= sl_price:
++                    exit_reason, exit_price = "SL", sl_price
++                elif row["high"] >= tp_price:
++                    exit_reason, exit_price = "TP", tp_price
++                elif row["signal"] == "bajista":
++                    exit_reason, exit_price = "señal_contraria", row["close"]
++            else:
++                if row["high"] >= sl_price:
++                    exit_reason, exit_price = "SL", sl_price
++                elif row["low"] <= tp_price:
++                    exit_reason, exit_price = "TP", tp_price
++                elif row["signal"] == "alcista":
++                    exit_reason, exit_price = "señal_contraria", row["close"]
++
++            if exit_reason:
++                risk = abs(entry_price - sl_price)
++                raw_pnl = (exit_price - entry_price) if direction == "alcista" else (entry_price - exit_price)
++                pnl_r = raw_pnl / risk if risk > 0 else 0
++
++                trades.append({
++                    "entry_time": entry_time,
++                    "exit_time": row["time"],
++                    "direction": direction,
++                    "entry_price": entry_price,
++                    "exit_price": exit_price,
++                    "exit_reason": exit_reason,
++                    "pnl": round(pnl_r, 3),
++                })
++                in_position = False
++
++    return pd.DataFrame(trades)
++
++
++def run_backtest(df_bias: pd.DataFrame, df_confirm: pd.DataFrame, df_entry: pd.DataFrame) -> pd.DataFrame:
++    """Pipeline completo: alinea timeframes, genera señales, simula trades."""
++    merged = align_multi_timeframe(df_bias, df_confirm, df_entry)
++    merged = generate_signals(merged)
++    trades = simulate_trades(merged)
++    return trades
++
++
++if __name__ == "__main__":
++    from data.fetch_mt5 import fetch_mt5_candles
++    from backtest.metrics import calculate_metrics
++
++    symbol = "EURUSD"
++    df_d1 = fetch_mt5_candles(symbol, "D1", 1000)
++    df_h4 = fetch_mt5_candles(symbol, "H4", 1000)
++    df_h1 = fetch_mt5_candles(symbol, "H1", 1000)
++
++    trades = run_backtest(df_d1, df_h4, df_h1)
++
++    print(f"Total de trades simulados: {len(trades)}")
++    if not trades.empty:
++        print(trades.tail(10))
++
++        split_idx = int(len(trades) * 0.7)
++        in_sample = trades.iloc[:split_idx]
++        out_sample = trades.iloc[split_idx:]
++
++        print("\n=== IN-SAMPLE (70%) ===")
++        print(calculate_metrics(in_sample))
++
++        print("\n=== OUT-OF-SAMPLE (30%) ===")
++        print(calculate_metrics(out_sample))
+diff --git a/tests/verify_engine.py b/tests/verify_engine.py
+new file mode 100644
+index 0000000..422b9d0
+--- /dev/null
++++ b/tests/verify_engine.py
+@@ -0,0 +1,60 @@
++import sys, types, importlib.util
++sys.path.insert(0, ".")
++for name in ["mt5linux", "binance", "binance.client", "binance.enums", "dotenv"]:
++    m = types.ModuleType(name); m.MetaTrader5 = object; m.Client = type("C", (), {}); m.load_dotenv = lambda *a, **k: None
++    sys.modules[name] = m
++import numpy as np, pandas as pd
++import backtest.engine as new
++spec = importlib.util.spec_from_file_location("engine_old", "tests/_engine_old_reference.py"); old = importlib.util.module_from_spec(spec); spec.loader.exec_module(old)
++
++ok = []
++def check(n, c, extra=""): ok.append(c); print("OK   " if c else "FALLA", n, extra)
++
++# ---------- 1) regresión: con los parámetros viejos (SL 1.5, TP 4.5) da exactamente lo mismo ----------
++rng = np.random.default_rng(3)
++n = 6000
++c = 100 * np.exp(np.cumsum(rng.normal(0, 0.004, n)))
++sp = np.abs(rng.normal(0, 0.002, n)) * c
++df = pd.DataFrame({"time": pd.date_range("2026-01-01", periods=n, freq="h"), "open": c, "high": c + sp, "low": c - sp, "close": c,
++                   "atr": np.abs(rng.normal(0.6, 0.1, n)),
++                   "signal": rng.choice(["alcista", "bajista", "sin_senal"], n, p=[0.04, 0.04, 0.92])})
++t_old = old.simulate_trades(df)
++t_new = new.simulate_trades(df, sl_mult=1.5, tp_mult=4.5)
++cols = ["entry_time", "exit_time", "direction", "entry_price", "exit_price", "exit_reason", "pnl"]
++same = (len(t_old) == len(t_new) > 100 and all((t_old[k].values == t_new[k].values).all() for k in ["entry_time","exit_time","direction","exit_reason","pnl"])
++        and np.allclose(t_old.entry_price, t_new.entry_price, rtol=0, atol=1e-9) and np.allclose(t_old.exit_price, t_new.exit_price, rtol=0, atol=1e-9))
++check("regresión: mismos trades que el motor anterior (SL 1.5 / TP 4.5)", same, f"({len(t_old)} trades; entrada, salida, motivo y PnL idénticos)")
++
++# ---------- 2) casos armados a mano (SL 1.0 ATR, TP 1.5 ATR, ATR = 1.0, entrada = 100) ----------
++def path(bars, signal_first="alcista"):
++    rows = [dict(time=pd.Timestamp("2026-01-01"), open=100, high=100, low=100, close=100, atr=1.0, signal="sin_senal")]
++    rows.append(dict(time=pd.Timestamp("2026-01-01 01:00"), open=100, high=100, low=100, close=100, atr=1.0, signal=signal_first))
++    for k, (h, l, cl) in enumerate(bars, start=2):
++        rows.append(dict(time=pd.Timestamp("2026-01-01") + pd.Timedelta(hours=k), open=cl, high=h, low=l, close=cl, atr=1.0, signal="sin_senal"))
++    return pd.DataFrame(rows)
++def sim(bars, **kw):
++    kw.setdefault("sl_mult", 1.0); kw.setdefault("tp_mult", 1.5)
++    return new.simulate_trades(path(bars, kw.pop("sig", "alcista")), **kw)
++
++t = sim([(100.4, 99.8, 100.2), (101.6, 100.1, 101.5)])
++check("compra: llega al TP 1.5 ATR  -> +1.5R", len(t) == 1 and t.pnl[0] == 1.5 and t.exit_reason[0] == "TP", f"| {t.pnl[0]}R")
++t = sim([(100.4, 98.9, 99.2)])
++check("compra: toca el SL 1.0 ATR   -> -1.0R", t.pnl[0] == -1.0 and t.exit_reason[0] == "SL")
++t = sim([(100.3, 99.8, 100.1), (100.5, 99.9, 100.2), (100.7, 100.0, 100.6), (100.9, 100.2, 100.6)], max_hold_bars=3)
++check("límite de tiempo: a las 3 velas cierra a mercado", t.exit_reason[0] == "tiempo" and t.bars_held[0] == 3 and abs(t.pnl[0] - 0.6) < 1e-9, f"| {t.exit_reason[0]}, {t.pnl[0]}R, {t.bars_held[0]} velas")
++t = sim([(100.6, 100.0, 100.3), (100.4, 99.9, 100.1)], ladder=True)
++check("SL escalonado: tras +0.5R el retroceso sale en breakeven (0R)", t.exit_reason[0] == "SL_escalonado" and t.pnl[0] == 0.0)
++t = sim([(100.6, 100.0, 100.3), (100.4, 99.9, 100.1), (100.3, 99.5, 100.0)], ladder=False)
++check("sin escalonado, ese mismo retroceso NO cierra (la posición sigue abierta)", len(t) == 0)
++t = sim([(101.1, 100.0, 100.9), (100.9, 100.4, 100.6)], ladder=True)
++check("SL escalonado: tras +1R el SL queda en +0.5R", t.exit_reason[0] == "SL_escalonado" and t.pnl[0] == 0.5, f"| {t.pnl[0]}R")
++t = sim([(100.0, 98.4, 98.9), ], sig="bajista", sl_mult=1.0, tp_mult=1.5)
++check("venta: TP 1.5 ATR abajo      -> +1.5R", len(t) == 1 and t.pnl[0] == 1.5 and t.exit_reason[0] == "TP", f"| {t.pnl[0]}R")
++t = sim([(101.2, 99.9, 101.0)], sig="bajista")
++check("venta: toca el SL arriba     -> -1.0R", t.pnl[0] == -1.0 and t.exit_reason[0] == "SL")
++t = sim([(101.6, 100.1, 101.5)], cost_atr=0.1)
++check("costo 0.1 ATR por trade resta 0.1R con SL=1 ATR", abs(t.pnl[0] - 1.4) < 1e-9, f"| {t.pnl[0]}R")
++check("defaults de settings: SL 1.0 ATR, TP 1.5 ATR (ratio 1.5)", new.ATR_SL_MULTIPLIER == 1.0 and abs(new.RISK_REWARD_RATIO - 1.5) < 1e-9)
++import config.settings as S
++check("MULTI_TP_LEVELS final deriva de los multiplicadores", abs(S.MULTI_TP_LEVELS[2][0] - 1.5) < 1e-9, f"| {S.MULTI_TP_LEVELS}")
++print(f"\nRESULTADO: {sum(ok)}/{len(ok)} OK"); sys.exit(0 if all(ok) else 1)
+diff --git a/tests/verify_exits_and_selection.py b/tests/verify_exits_and_selection.py
+new file mode 100644
+index 0000000..569b61c
+--- /dev/null
++++ b/tests/verify_exits_and_selection.py
+@@ -0,0 +1,167 @@
++import sys, types, io, contextlib, os, tempfile
++from collections import namedtuple
++sys.path.insert(0, ".")
++import numpy as np, pandas as pd
++
++# ---- stubs de librerías externas ----
++for name in ["mt5linux", "binance", "binance.client", "binance.enums", "dotenv"]:
++    m = types.ModuleType(name); m.MetaTrader5 = object
++    m.Client = type("Client", (), {k: 1 for k in ["KLINE_INTERVAL_1MINUTE","KLINE_INTERVAL_5MINUTE","KLINE_INTERVAL_15MINUTE","KLINE_INTERVAL_30MINUTE","KLINE_INTERVAL_1HOUR","KLINE_INTERVAL_4HOUR","KLINE_INTERVAL_1DAY","KLINE_INTERVAL_1WEEK"]})
++    m.load_dotenv = lambda *a, **k: None
++    sys.modules[name] = m
++
++import execution.position_tracker as tracker
++tracker.TRACKER_FILE = os.path.join(tempfile.mkdtemp(), "state.json")
++import data.fetch_mt5 as fm
++import execution.mt5_executor as ex
++import execution.multi_tp_monitor as mon
++import scanner.run_live as rl
++
++Pos = namedtuple("Pos", "ticket symbol type volume sl tp price_open")
++
++class Tick: 
++    def __init__(s, bid, ask): s.bid, s.ask = bid, ask
++
++class FakeMT5:
++    ORDER_TYPE_BUY, ORDER_TYPE_SELL = 0, 1
++    TRADE_ACTION_DEAL, TRADE_ACTION_SLTP = 1, 6
++    ORDER_TIME_GTC = 0
++    ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN = 1, 0, 2
++    TRADE_RETCODE_DONE = 10009
++    def __init__(s):
++        s.positions, s.ticks, s.sent, s.fail_next, s.info = {}, {}, [], [], {}
++        s.loss_per_lot = {}; s.market_closed = set(); s.next_ticket = 1000
++    def symbol_select(s, *a): return True
++    def last_error(s): return (1, "ok")
++    def symbol_info_tick(s, sym): return s.ticks.get(sym)
++    def symbol_info(s, sym): return s.info.get(sym)
++    def positions_get(s, ticket=None):
++        if ticket is None: return list(s.positions.values())
++        return [s.positions[ticket]] if ticket in s.positions else []
++    def order_calc_profit(s, otype, sym, vol, p_open, p_close):
++        return -s.loss_per_lot.get(sym, 5.0) * vol
++    def order_send(s, req):
++        s.sent.append(req)
++        R = types.SimpleNamespace
++        if s.fail_next:
++            code = s.fail_next.pop(0); return R(retcode=code, comment=f"fail {code}", order=0)
++        if req["action"] == s.TRADE_ACTION_SLTP:
++            p = s.positions[req["position"]]; s.positions[p.ticket] = p._replace(sl=req["sl"])
++            return R(retcode=10009, comment="ok", order=0)
++        if req["symbol"] in s.market_closed:
++            return R(retcode=10018, comment="Market closed", order=0)
++        s.next_ticket += 1
++        s.positions[s.next_ticket] = Pos(s.next_ticket, req["symbol"], req["type"], req["volume"], req["sl"], req["tp"], req["price"])
++        return R(retcode=10009, comment="ok", order=s.next_ticket)
++
++mt5 = FakeMT5()
++fm.get_mt5_connection = lambda: mt5; ex.get_mt5_connection = lambda: mt5; mon.get_mt5_connection = lambda: mt5
++fetch_calls = []
++def fake_fetch(sym, tf, n=200):
++    fetch_calls.append(sym)
++    # velas con rango constante 1.0 -> ATR ≈ 1.0
++    c = np.full(n, 100.0); return pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c})
++mon.fetch_mt5_candles = fake_fetch
++
++def run(f, *a):
++    buf = io.StringIO()
++    with contextlib.redirect_stdout(buf): f(*a)
++    return buf.getvalue().strip()
++
++checks = []
++def check(name, cond, extra=""):
++    checks.append(cond); print(("OK   " if cond else "FALLA"), name, extra)
++
++# ================= MONITOR: compra =================
++tracker.register_position(7, "ETHUSDm", "alcista", 100.0, 1.5)   # riesgo original 1.5 (SL 98.5)
++mt5.positions[7] = Pos(7, "ETHUSDm", 0, 0.01, 98.5, 104.5, 100.0)
++def set_price(p): mt5.ticks["ETHUSDm"] = Tick(p, p + 0.02)
++sl = lambda: mt5.positions[7].sl
++
++set_price(100.5); out = run(mon.process_position, 7)
++check("compra: bajo TP1 no toca nada", sl() == 98.5 and out == "")
++set_price(100.8); out = run(mon.process_position, 7)
++check("compra: TP1 (0.75) -> SL a breakeven", sl() == 100.0, f"| {out}")
++set_price(101.6); out = run(mon.process_position, 7)
++check("compra: TP2 (1.5) -> SL al nivel de TP1", abs(sl() - 100.75) < 1e-9, f"| {out}")
++check("trailing pidió velas con símbolo SIN doble 'm'", fetch_calls[-1] == "ETHUSD", f"(pidió '{fetch_calls[-1]}')")
++set_price(103.5); out = run(mon.process_position, 7)
++check("compra: trailing sube el SL (103.5 - 2*ATR)", sl() > 100.75 and sl() < 103.5, f"| SL={sl():.3f}")
++sl_before = sl(); set_price(102.0); out = run(mon.process_position, 7)
++check("compra: si el precio retrocede el SL NO se afloja", sl() == sl_before and out == "")
++mt5.positions.pop(7); run(mon.process_position, 7)
++check("posición cerrada -> se quita del registro", tracker.get_position_state(7) is None)
++
++# ---- escenario del bug del monitor anterior: entrada 100, SL trailing en 104, precio 108
++tracker.register_position(8, "ETHUSDm", "alcista", 100.0, 1.5)
++tracker.mark_tp_level_hit(8, 0); tracker.mark_tp_level_hit(8, 1)
++mt5.positions[8] = Pos(8, "ETHUSDm", 0, 0.01, 104.0, 120.0, 100.0)
++mt5.ticks["ETHUSDm"] = Tick(108.0, 108.02); run(mon.process_position, 8)
++check("bug anterior: SL en 104 y precio 108 -> NO baja a 100", mt5.positions[8].sl >= 104.0, f"| SL={mt5.positions[8].sl}")
++
++# ================= MONITOR: venta =================
++tracker.register_position(9, "EURUSDm", "bajista", 100.0, 1.5)
++mt5.positions[9] = Pos(9, "EURUSDm", 1, 0.01, 101.5, 95.5, 100.0)
++mt5.ticks["EURUSDm"] = Tick(99.2, 99.25); run(mon.process_position, 9)
++check("venta: TP1 -> SL a breakeven", mt5.positions[9].sl == 100.0)
++mt5.ticks["EURUSDm"] = Tick(98.4, 98.45); run(mon.process_position, 9)
++check("venta: TP2 -> SL al nivel de TP1", abs(mt5.positions[9].sl - 99.25) < 1e-9, f"| SL={mt5.positions[9].sl}")
++mt5.ticks["EURUSDm"] = Tick(96.0, 96.05); run(mon.process_position, 9)
++check("venta: trailing baja el SL", mt5.positions[9].sl < 99.25, f"| SL={mt5.positions[9].sl:.3f}")
++
++# ---- fallo al modificar: no marca niveles y reintenta
++tracker.register_position(10, "ETHUSDm", "alcista", 100.0, 1.5)
++mt5.positions[10] = Pos(10, "ETHUSDm", 0, 0.01, 98.5, 104.5, 100.0)
++mt5.ticks["ETHUSDm"] = Tick(100.8, 100.82); mt5.fail_next = [10016]
++out = run(mon.process_position, 10)
++check("fallo 10016: muestra retcode y NO marca el nivel", "retcode=10016" in out and tracker.get_position_state(10)["tp_levels_hit"] == [], f"| {out}")
++run(mon.process_position, 10)
++check("reintento en el siguiente ciclo funciona", mt5.positions[10].sl == 100.0 and tracker.get_position_state(10)["tp_levels_hit"] == [0])
++
++# ================= SELECCIÓN / LOTE FIJO =================
++from risk.engine import RiskEngine
++def info(mode=4, point=0.01): return types.SimpleNamespace(trade_mode=mode, volume_min=0.01, volume_step=0.01, volume_max=100.0, point=point)
++for s in ["BTCUSDm", "SOLUSDm", "ETHUSDm", "EURUSDm"]: mt5.info[s] = info()
++mt5.info["EURUSDm"] = info(point=0.00001)
++mt5.info["SOLUSDm"] = info(0)              # trading deshabilitado
++mt5.loss_per_lot.update({"BTCUSDm": 650.0, "ETHUSDm": 12.0, "EURUSDm": 200.0, "SOLUSDm": 1.2})
++for s_, b_ in [("BTCUSDm", 84800.0), ("SOLUSDm", 120.0), ("ETHUSDm", 2690.0), ("EURUSDm", 1.125)]: mt5.ticks[s_] = Tick(b_, b_ * 1.0001)
++mt5.market_closed.add("EURUSDm")
++mt5.positions.clear(); mt5.sent.clear()
++
++cands = pd.DataFrame([
++    dict(symbol="BTCUSD", category="crypto", direction="alcista", strength=0.80, entry_price=84800.0, sl_price=84150.0, tp_price=86750.0),
++    dict(symbol="SOLUSD", category="crypto", direction="alcista", strength=0.75, entry_price=120.0, sl_price=118.8, tp_price=123.6),
++    dict(symbol="EURUSD", category="forex",  direction="bajista", strength=0.70, entry_price=1.125, sl_price=1.127, tp_price=1.119),
++    dict(symbol="ETHUSD", category="crypto", direction="alcista", strength=0.65, entry_price=2690.0, sl_price=2678.0, tp_price=2726.0),
++])
++eng = RiskEngine(account_balance=500.0)
++out = run(rl.select_and_execute, cands, eng, set(), 500.0)
++print("---- salida de select_and_execute (balance $500) ----"); print(out); print("----")
++check("SOL con trading deshabilitado: se salta SIN intentar orden", "[NO OPERABLE] SOLUSD" in out and not any(r.get("symbol") == "SOLUSDm" for r in mt5.sent))
++check("EUR con mercado cerrado: falla y pasa a la siguiente candidata", "[MERCADO CERRADO] EURUSD" in out and "[EJECUTADO] ETHUSD" in out)
++sent_open = [r for r in mt5.sent if r["action"] == mt5.TRADE_ACTION_DEAL and r["symbol"] in ("BTCUSDm", "ETHUSDm")]
++check("BTC y ETH ejecutadas con lote 0.01 (float) a $500", len(sent_open) == 2 and all(r["volume"] == 0.01 and isinstance(r["volume"], float) for r in sent_open), f"({len(sent_open)} órdenes)")
++check("a $500 BTC arriesga ~$6.50 (1.3%) y pasa el tope", "[EJECUTADO] BTCUSD alcista | lotes=0.01 | riesgo=$6.50" in out)
++check("las ejecutadas quedan registradas para el monitor (con riesgo original)", all(tracker.get_position_state(t) and tracker.get_position_state(t)["risk_distance"] > 0 for t in mt5.positions))
++
++mt5.positions.clear(); mt5.sent.clear()
++eng2 = RiskEngine(account_balance=50.0)
++out2 = run(rl.select_and_execute, cands.iloc[[0, 3]], eng2, set(), 50.0)
++print("---- con capital de $50 ----"); print(out2); print("----")
++check("con $50, BTC (~13%) se omite por el tope del 3% y ETH (~0.2%) sí entra", "[OMITIDO] BTCUSD" in out2 and "[EJECUTADO] ETHUSD" in out2)
++
++# ================= CICLO COMPLETO (smoke test) =================
++mt5.positions.clear(); mt5.sent.clear()
++mt5.account_info = lambda: types.SimpleNamespace(balance=500.0)
++rl.run_full_scan = lambda: pd.DataFrame([
++    dict(symbol="BTCUSD", category="crypto", direction="alcista", strength=0.80, agreement="full", raw_momentum=11.0, entry_price=84800.0, sl_price=84150.0, tp_price=86750.0),
++    dict(symbol="EURUSD", category="forex", direction="bajista", strength=0.50, agreement="full", raw_momentum=-2.5, entry_price=1.125, sl_price=1.127, tp_price=1.119),
++])
++out3 = run(rl.run_one_cycle)
++print("---- salida de run_one_cycle ----"); print(out3); print("----")
++check("el panel muestra señales de TODAS las categorías antes del umbral", "forex:" in out3 and "crypto:" in out3)
++check("las candidatas muestran SL y TP en puntos (BTC: 650 -> 65000 pts)", "sl_pts" in out3 and "tp_pts" in out3 and "65000" in out3)
++
++print(f"\nRESULTADO: {sum(checks)}/{len(checks)} comprobaciones OK")
++sys.exit(0 if all(checks) else 1)
+diff --git a/tests/verify_scan_smoke.py b/tests/verify_scan_smoke.py
+new file mode 100644
+index 0000000..cd349f6
+--- /dev/null
++++ b/tests/verify_scan_smoke.py
+@@ -0,0 +1,56 @@
++import sys, types, io, contextlib, zlib
++sys.path.insert(0, ".")
++for name in ["mt5linux", "binance", "binance.client", "binance.enums", "dotenv"]:
++    m = types.ModuleType(name); m.MetaTrader5 = object
++    m.Client = type("Client", (), {k: 1 for k in ["KLINE_INTERVAL_1MINUTE","KLINE_INTERVAL_5MINUTE","KLINE_INTERVAL_15MINUTE","KLINE_INTERVAL_30MINUTE","KLINE_INTERVAL_1HOUR","KLINE_INTERVAL_4HOUR","KLINE_INTERVAL_1DAY","KLINE_INTERVAL_1WEEK"]})
++    m.load_dotenv = lambda *a, **k: None
++    sys.modules[name] = m
++import numpy as np, pandas as pd
++import scanner.run_scan as rs
++import config.settings as S
++
++seen = {}
++STEP = {"D1": 1440, "H4": 240, "H1": 60}
++def synth(symbol, tf, n=200):
++    seen.setdefault(symbol, set()).add(tf)
++    seed = zlib.crc32(f"{symbol}".encode()) % 10_000
++    rng = np.random.default_rng(seed + {"D1": 1, "H4": 2, "H1": 3}[tf])
++    kind = seed % 10                       # 0-3 sube, 4-6 baja, 7-9 lateral
++    drift = {True: 0.0, False: 0.0}
++    vol = 0.004 * (STEP[tf] / 1440) ** 0.5 + 0.0005
++    mu = (0.9 * vol) if kind <= 3 else (-0.9 * vol) if kind <= 6 else 0.0
++    close = 100 * np.exp(np.cumsum(rng.normal(mu, vol, n)))
++    spread = np.abs(rng.normal(0, vol / 2, n)) * close
++    t0 = pd.Timestamp("2026-01-01")
++    return pd.DataFrame({"time": [t0 + pd.Timedelta(minutes=STEP[tf] * i) for i in range(n)],
++                         "open": close, "high": close + spread, "low": close - spread, "close": close,
++                         "tick_volume": 1000, "symbol": symbol})
++rs.fetch_mt5_candles = synth
++
++buf = io.StringIO()
++with contextlib.redirect_stdout(buf):
++    df = rs.run_full_scan()
++errores = [l for l in buf.getvalue().splitlines() if "ERROR" in l]
++
++universo = S.FOREX_SYMBOLS + S.CRYPTO_SYMBOLS + S.COMMODITY_SYMBOLS + S.ETF_SYMBOLS
++print(f"Símbolos del universo: {len(universo)} | analizados (con datos pedidos): {len(seen)}")
++print(f"Timeframes pedidos por símbolo: { {s: sorted(v) for s, v in list(seen.items())[:1]} } (ejemplo)")
++print(f"Errores durante el escaneo: {len(errores)}", errores[:3])
++print(f"Señales devueltas: {len(df)} | columnas: {list(df.columns)}")
++print(df[["symbol", "category", "direction", "strength", "agreement", "regime"]].to_string(index=False))
++print("\nRégimen asignado a las señales:", df["regime"].value_counts().to_dict())
++ok = len(seen) == len(universo) and not errores and {"entry_price", "sl_price", "tp_price", "regime", "raw_momentum"} <= set(df.columns)
++# SL/TP: relación 1:3 y lado correcto
++r = df.assign(riesgo=(df.entry_price - df.sl_price).abs(), recompensa=(df.tp_price - df.entry_price).abs())
++esperado = S.TP_ATR_MULTIPLIER / S.SL_ATR_MULTIPLIER
++ratio_ok = np.allclose(r.recompensa / r.riesgo, esperado, atol=0.02)
++lado_ok = all((row.sl_price < row.entry_price < row.tp_price) if row.direction == "alcista" else (row.tp_price < row.entry_price < row.sl_price) for row in df.itertuples())
++print(f"\nRatio recompensa/riesgo = {esperado} (según settings) en todas: {ratio_ok} | SL/TP del lado correcto: {lado_ok}")
++print("PIPELINE COMPLETO:", "OK" if ok and ratio_ok and lado_ok else "REVISAR")
++
++# ---- Backtest con datos sintéticos (comprueba que el motor sigue corriendo) ----
++from backtest.engine import run_backtest, ATR_SL_MULTIPLIER, RISK_REWARD_RATIO
++from backtest.metrics import calculate_metrics
++d1, h4, h1 = synth("EURUSD", "D1", 600), synth("EURUSD", "H4", 1500), synth("EURUSD", "H1", 5000)
++tr = run_backtest(d1, h4, h1)
++print(f"\nBacktest sintético: {len(tr)} trades | {calculate_metrics(tr) if len(tr) else 'sin trades'}")

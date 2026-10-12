@@ -1,0 +1,11 @@
+# Dependencias del scanner (Python 3.10, probado en Linux Mint).
+pandas
+numpy
+python-dotenv
+rpyc==5.0.1
+
+# mt5linux se instala APARTE y sin dependencias (su pin de numpy no funciona con pip moderno):
+#   pip install mt5linux==0.1.9 --no-deps
+
+# Solo para el código heredado de Binance (data/fetch_binance*.py, execution/binance_*), fuera del flujo actual:
+# python-binance
