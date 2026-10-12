@@ -118,6 +118,13 @@ def run_full_scan() -> pd.DataFrame:
 
 
 def get_viable_trades_with_risk(df: pd.DataFrame, account_balance: float, threshold: float = CONFLUENCE_THRESHOLD) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    # Verificamos que la columna 'strength' exista antes de filtrar
+    if "strength" not in df.columns:
+        return pd.DataFrame()
+
     viable = df[df["strength"] >= threshold].copy()
     if viable.empty:
         return viable
@@ -156,6 +163,18 @@ def get_viable_trades_with_risk(df: pd.DataFrame, account_balance: float, thresh
 if __name__ == "__main__":
     ACCOUNT_BALANCE = 500.0
 
+    from execution.health_check import check_and_repair_connection, ensure_server_running
+
+    print("--- Iniciando Verificación de Sistema ---")
+    if not check_and_repair_connection():
+        ensure_server_running()
+        # Segunda verificación tras intentar levantar el servidor
+        if not check_and_repair_connection():
+            print("\n❌ CRITICAL ERROR: No se pudo establecer conexión con MT5.")
+            print("Asegúrate de que el terminal de MT5 esté abierto y el 'Algo Trading' activado.")
+            exit(1)
+
+    print("\n--- Sistema Listo ---")
     print("Corriendo scan multi-estrategia (100% MT5/Exness)...\n")
     all_results = run_full_scan()
 
