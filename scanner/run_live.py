@@ -24,7 +24,7 @@ from execution.mt5_executor import (
     get_mt5_connection,
 )
 
-SCAN_INTERVAL_MINUTES = 15
+SCAN_INTERVAL_MINUTES = 4
 
 CATEGORY_BY_SYMBOL = {}
 for _cat, _syms in {
