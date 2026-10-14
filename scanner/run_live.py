@@ -13,6 +13,7 @@ import traceback
 from config.settings import (
     FOREX_SYMBOLS, CRYPTO_SYMBOLS, COMMODITY_SYMBOLS, ETF_SYMBOLS,
     CONFLUENCE_THRESHOLD, FIXED_LOT, MAX_RISK_PER_TRADE_PCT,
+    MAX_SPREAD_FRACTION_OF_TP,
 )
 from scanner.run_scan import run_full_scan
 from risk.engine import RiskEngine
@@ -20,6 +21,7 @@ from execution.mt5_executor import (
     execute_mt5_order, get_open_mt5_positions, get_effective_balance,
     calculate_mt5_volume, estimate_position_open_risk,
     calculate_fixed_volume, check_symbol_tradable, distance_in_points,
+    get_mt5_connection,
 )
 
 SCAN_INTERVAL_MINUTES = 15
@@ -32,10 +34,8 @@ for _cat, _syms in {
     for _s in _syms:
         CATEGORY_BY_SYMBOL[_s] = _cat
 
-
 def to_standard_symbol(mt5_symbol: str) -> str:
     return mt5_symbol[:-1] if mt5_symbol.endswith("m") else mt5_symbol
-
 
 def rank_candidates(df):
     """Ordena por fuerza; desempata por coincidencia entre estrategias y luego por momentum."""
@@ -50,7 +50,6 @@ def rank_candidates(df):
         ascending=[False, True, False],
     )
     return df.reset_index(drop=True)
-
 
 def build_engine_from_open_positions(balance: float):
     """Carga las posiciones reales abiertas en MT5 al motor de riesgo."""
@@ -70,8 +69,7 @@ def build_engine_from_open_positions(balance: float):
 
     return engine, open_symbols
 
-
-def select_and_execute(candidates, engine, open_symbols, balance):
+def select_and_execute(candidates, engine, open_symbols, balance, dry_run=False):
     executed, skipped, failed = [], [], []
 
     for _, row in candidates.iterrows():
@@ -114,10 +112,26 @@ def select_and_execute(candidates, engine, open_symbols, balance):
                 continue
             risk_pct = sizing["actual_risk"] / balance
 
+        # --- Filtro de Spread ---
+        tp_dist = abs(row["tp_price"] - row["entry_price"])
+        mt5 = get_mt5_connection()
+        info = mt5.symbol_info(symbol + "m")
+        if info:
+            current_spread = float(info.spread) * info.point
+            if tp_dist > 0 and (current_spread / tp_dist) > MAX_SPREAD_FRACTION_OF_TP:
+                print(f"  [OMITIDO] {symbol}: spread {current_spread:.5f} demasiado alto vs TP {tp_dist:.5f} ({current_spread/tp_dist:.1%})")
+                skipped.append(symbol)
+                continue
+
         can_open, reason = engine.can_open_trade(category, risk_pct)
         if not can_open:
             print(f"  [OMITIDO] {symbol}: {reason}")
             skipped.append(symbol)
+            continue
+
+        if dry_run:
+            print(f"  [DRY-RUN] would execute {symbol} {direction} | lotes={sizing['volume']} | riesgo=${sizing['actual_risk']:.2f}")
+            executed.append(symbol)
             continue
 
         result = execute_mt5_order(
@@ -139,10 +153,11 @@ def select_and_execute(candidates, engine, open_symbols, balance):
     print(f"\nResumen: {len(executed)} ejecutadas, {len(skipped)} omitidas, {len(failed)} fallidas")
     return executed
 
-
-def run_one_cycle():
+def run_one_cycle(dry_run=False):
     print(f"\n{'=' * 60}")
     print(f"Ciclo de scan: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+    if dry_run:
+        print("MODO DRY-RUN ACTIVO: no se enviarán órdenes reales")
     print("=" * 60)
 
     balance = get_effective_balance()
@@ -175,23 +190,24 @@ def run_one_cycle():
     engine, open_symbols = build_engine_from_open_positions(balance)
     print(f"\nPosiciones ya abiertas: {sorted(open_symbols) or 'ninguna'}")
     print("\nSeleccionando y ejecutando:")
-    select_and_execute(candidates, engine, open_symbols, balance)
+    select_and_execute(candidates, engine, open_symbols, balance, dry_run=dry_run)
 
-
-def run_continuous():
+def run_continuous(dry_run=False):
     print(f"Iniciando scanner continuo (intervalo: {SCAN_INTERVAL_MINUTES} min)")
+    if dry_run:
+        print("MODO DRY-RUN ACTIVO")
     while True:
         try:
-            run_one_cycle()
+            run_one_cycle(dry_run=dry_run)
         except Exception as e:
             print(f"\n[ERROR EN EL CICLO] {e}")
             traceback.print_exc()
         print(f"\nEsperando {SCAN_INTERVAL_MINUTES} minutos hasta el próximo ciclo...")
         time.sleep(SCAN_INTERVAL_MINUTES * 60)
 
-
 if __name__ == "__main__":
+    dry_run = "--dry-run" in sys.argv
     if "--once" in sys.argv:
-        run_one_cycle()
+        run_one_cycle(dry_run=dry_run)
     else:
-        run_continuous()
+        run_continuous(dry_run=dry_run)

@@ -24,3 +24,25 @@ Formato: fecha, quién (chat / Claude Code), archivos tocados y por qué.
 - `tests/verify_*.py` (nuevos): motor de backtest (incluye regresión contra `tests/_engine_old_reference.py`), monitor y selección con un MT5 simulado, y escaneo completo sintético.
 - `docs/TAREAS_CLAUDE_CODE.md` (nuevo): tareas pendientes por fases.
 2026-10-12: Aplicación del parche todo-junto.patch para reconciliar el estado del proyecto (monitor combinado, gestión de riesgo y parámetros de confluencia).
+2026-10-12 - scanner/run_scan.py - Integrated mt5linux health check for auto-repair of connection and dependencies.
+
+## 2026-10-13 — Claude Code — Robust MT5/mt5linux bootstrap, preflight `--check`, y conexión resiliente
+
+- `config/settings.py`: agrega `ALLOW_LIVE_ACCOUNT = False` (solo cuenta demo por defecto).
+- `scanner/mt5_bootstrap.py` (nuevo): fuente única de verdad para arranque automático y diagnóstico por capas. Incluye `ensure_mt5_ready()`, `preflight_check()`, arranque de servidor `-w wine python`, terminación de PIDs huérfanos, handshake MT5 (broker, AutoTrading, cuenta demo), y verificación de paridad de rpyc Linux/Wine. Sin rutas hardcoded ni `pgrep -f`.
+- `scanner/run_all.py`: integrado `--check` (preflight diagnóstico), llama a `ensure_mt5_ready()` en vez de `start_mt5.sh`. Eliminada la función `wait_for_port()` duplicada.
+- `execution/connection_manager.py`: `_is_alive()` ahora captura explícitamente `EOFError`, `ConnectionResetError`, `ConnectionRefusedError`, `TimeoutError`, `OSError`, `AttributeError` para detectar caídas del puente RPyC.
+- `scanner/run_scan.py`: removido el bloque de health‑check en `__main__`; el arranque ahora es responsabilidad exclusiva de `run_all --check` y el módulo bootstrap.
+- `start_mt5.sh`: reescrito como wrapper delgado que delega a `python -m scanner.mt5_bootstrap --start`. Sin rutas de usuario ni detección por `pgrep`.
+- `tests/test_mt5_bootstrap.py`: pruebas simuladas para arranque, PID huérfano, cuenta demo/live, AutoTrading, y desajuste de rpyc.
+- `CHANGELOG.md`: entrada actualizada con los cambios.
+
+## 2026-10-13 — Claude Code — Fix timeframe constants para mt5linux bridge
+- `data/fetch_mt5.py`: corregidos los valores de `MT5_TIMEFRAME_MAP`. Los timeframes H1, H4, D1, W1 usaban valores en minutos (60, 240, 1440, 10080) pero mt5linux requiere las constantes enteras de MT5:
+  - H1: 16385 (no 60)
+  - H4: 16388 (no 240)
+  - D1: 16408 (no 1440)
+  - W1: 32769 (no 10080)
+- Los valores fueron verificados en `mt5linux/__init__.py` líneas 168-210 (TIMEFRAME_H1 = 16385, etc.)
+- `execution/connection_manager.py`: Singleton que gestiona la conexión RPyC al servidor mt5linux con auto-reconexión y health check
+- Este fix resuelve el error: `AttributeError: 'SlaveService' object has no attribute 'TIMEFRAME_H1'`

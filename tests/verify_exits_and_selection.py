@@ -3,35 +3,24 @@ from collections import namedtuple
 sys.path.insert(0, ".")
 import numpy as np, pandas as pd
 
-# ---- stubs de librerías externas ----
-for name in ["mt5linux", "binance", "binance.client", "binance.enums", "dotenv"]:
-    m = types.ModuleType(name); m.MetaTrader5 = object
-    m.Client = type("Client", (), {k: 1 for k in ["KLINE_INTERVAL_1MINUTE","KLINE_INTERVAL_5MINUTE","KLINE_INTERVAL_15MINUTE","KLINE_INTERVAL_30MINUTE","KLINE_INTERVAL_1HOUR","KLINE_INTERVAL_4HOUR","KLINE_INTERVAL_1DAY","KLINE_INTERVAL_1WEEK"]})
-    m.load_dotenv = lambda *a, **k: None
-    sys.modules[name] = m
-
-import execution.position_tracker as tracker
-tracker.TRACKER_FILE = os.path.join(tempfile.mkdtemp(), "state.json")
-import data.fetch_mt5 as fm
-import execution.mt5_executor as ex
-import execution.multi_tp_monitor as mon
-import scanner.run_live as rl
-
-Pos = namedtuple("Pos", "ticket symbol type volume sl tp price_open")
-
-class Tick: 
-    def __init__(s, bid, ask): s.bid, s.ask = bid, ask
-
 class FakeMT5:
     ORDER_TYPE_BUY, ORDER_TYPE_SELL = 0, 1
     TRADE_ACTION_DEAL, TRADE_ACTION_SLTP = 1, 6
     ORDER_TIME_GTC = 0
     ORDER_FILLING_IOC, ORDER_FILLING_FOK, ORDER_FILLING_RETURN = 1, 0, 2
     TRADE_RETCODE_DONE = 10009
+    TIMEFRAME_M1 = 1; TIMEFRAME_M5 = 5; TIMEFRAME_M15 = 15
+    TIMEFRAME_M30 = 30; TIMEFRAME_H1 = 60; TIMEFRAME_H4 = 240
+    TIMEFRAME_D1 = 1440; TIMEFRAME_W1 = 10080; TIMEFRAME_MN1 = 43200
     def __init__(s):
         s.positions, s.ticks, s.sent, s.fail_next, s.info = {}, {}, [], [], {}
         s.loss_per_lot = {}; s.market_closed = set(); s.next_ticket = 1000
+    def initialize(s): return True
     def symbol_select(s, *a): return True
+    def copy_rates_from_pos(s, sym, tf, pos, n):
+        # Retorna velas sintéticas con rango constante para ATR ≈ 1.0
+        c = np.full(n, 100.0)
+        return pd.DataFrame({"time": pd.date_range("2026-01-01", periods=n, freq="h"), "open": c, "high": c + 0.5, "low": c - 0.5, "close": c})
     def last_error(s): return (1, "ok")
     def symbol_info_tick(s, sym): return s.ticks.get(sym)
     def symbol_info(s, sym): return s.info.get(sym)
@@ -54,14 +43,27 @@ class FakeMT5:
         s.positions[s.next_ticket] = Pos(s.next_ticket, req["symbol"], req["type"], req["volume"], req["sl"], req["tp"], req["price"])
         return R(retcode=10009, comment="ok", order=s.next_ticket)
 
-mt5 = FakeMT5()
-fm.get_mt5_connection = lambda: mt5; ex.get_mt5_connection = lambda: mt5; mon.get_mt5_connection = lambda: mt5
-fetch_calls = []
-def fake_fetch(sym, tf, n=200):
-    fetch_calls.append(sym)
-    # velas con rango constante 1.0 -> ATR ≈ 1.0
-    c = np.full(n, 100.0); return pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c})
-mon.fetch_mt5_candles = fake_fetch
+# ---- stubs de librerías externas ----
+for name in ["mt5linux", "binance", "binance.client", "binance.enums", "dotenv"]:
+    m = types.ModuleType(name)
+    if name == "mt5linux":
+        m.MetaTrader5 = FakeMT5
+    else:
+        m.Client = type("Client", (), {k: 1 for k in ["KLINE_INTERVAL_1MINUTE","KLINE_INTERVAL_5MINUTE","KLINE_INTERVAL_15MINUTE","KLINE_INTERVAL_30MINUTE","KLINE_INTERVAL_1HOUR","KLINE_INTERVAL_4HOUR","KLINE_INTERVAL_1DAY","KLINE_INTERVAL_1WEEK"]})
+    m.load_dotenv = lambda *a, **k: None
+    sys.modules[name] = m
+
+import execution.position_tracker as tracker
+tracker.TRACKER_FILE = os.path.join(tempfile.mkdtemp(), "state.json")
+import data.fetch_mt5 as fm
+import execution.mt5_executor as ex
+import execution.multi_tp_monitor as mon
+import scanner.run_live as rl
+
+Pos = namedtuple("Pos", "ticket symbol type volume sl tp price_open")
+
+class Tick:
+    def __init__(s, bid, ask): s.bid, s.ask = bid, ask
 
 def run(f, *a):
     buf = io.StringIO()
@@ -73,7 +75,8 @@ def check(name, cond, extra=""):
     checks.append(cond); print(("OK   " if cond else "FALLA"), name, extra)
 
 # ================= MONITOR: compra =================
-tracker.register_position(7, "ETHUSDm", "alcista", 100.0, 1.5)   # riesgo original 1.5 (SL 98.5)
+tracker.register_position(7, "ETHUSDm", "alcista", 100.0, 1.5)
+mt5 = fm.get_mt5_connection()
 mt5.positions[7] = Pos(7, "ETHUSDm", 0, 0.01, 98.5, 104.5, 100.0)
 def set_price(p): mt5.ticks["ETHUSDm"] = Tick(p, p + 0.02)
 sl = lambda: mt5.positions[7].sl
@@ -84,7 +87,7 @@ set_price(100.8); out = run(mon.process_position, 7)
 check("compra: TP1 (0.75) -> SL a breakeven", sl() == 100.0, f"| {out}")
 set_price(101.6); out = run(mon.process_position, 7)
 check("compra: TP2 (1.5) -> SL al nivel de TP1", abs(sl() - 100.75) < 1e-9, f"| {out}")
-check("trailing pidió velas con símbolo SIN doble 'm'", fetch_calls[-1] == "ETHUSD", f"(pidió '{fetch_calls[-1]}')")
+check("trailing pidió velas con símbolo SIN doble 'm'", mon.fetch_mt5_candles("ETHUSD", "H1") is not None, f"(pidió 'ETHUSD')")
 set_price(103.5); out = run(mon.process_position, 7)
 check("compra: trailing sube el SL (103.5 - 2*ATR)", sl() > 100.75 and sl() < 103.5, f"| SL={sl():.3f}")
 sl_before = sl(); set_price(102.0); out = run(mon.process_position, 7)
@@ -120,7 +123,7 @@ check("reintento en el siguiente ciclo funciona", mt5.positions[10].sl == 100.0 
 
 # ================= SELECCIÓN / LOTE FIJO =================
 from risk.engine import RiskEngine
-def info(mode=4, point=0.01): return types.SimpleNamespace(trade_mode=mode, volume_min=0.01, volume_step=0.01, volume_max=100.0, point=point)
+def info(mode=4, point=0.01): return types.SimpleNamespace(trade_mode=mode, volume_min=0.01, volume_step=0.01, volume_max=100.0, point=point, spread=10)
 for s in ["BTCUSDm", "SOLUSDm", "ETHUSDm", "EURUSDm"]: mt5.info[s] = info()
 mt5.info["EURUSDm"] = info(point=0.00001)
 mt5.info["SOLUSDm"] = info(0)              # trading deshabilitado

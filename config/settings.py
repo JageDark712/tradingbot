@@ -69,6 +69,19 @@ RISK_BASE_BY_CATEGORY = {
 MAX_AGGREGATE_RISK = 0.05       # 5% máximo de riesgo abierto simultáneo total
 MAX_TRADES_PER_CATEGORY = 5     # máximo de trades simultáneos por categoría
 
+# --- Parámetros de ejecución ---
+MAGIC_NUMBER = 123456           # ID único para rastrear órdenes del bot
+
+# --- Parámetros de salida corta (Scalping / Day Trading) ---
+ATR_SL_MULTIPLIER = 1.0
+RISK_REWARD_RATIO = 1.2
+
+# --- Parámetros de salida corta (Scalping / Day Trading) ---
+# Un multiplicador menor (1.0) hace que el Stop Loss sea más ceñido
+# Un RR menor (1.2 a 1.5) hace que el TP sea mucho más alcanzable en pocas horas
+ATR_SL_MULTIPLIER = 1.0
+RISK_REWARD_RATIO = 1.2
+
 ACCOUNT_LEVERAGE_CAP = 1.0      # apalancamiento máximo (techo, no objetivo)
 
 # --- Distancia de SL y TP final, en múltiplos del ATR de H1 ---
@@ -94,5 +107,12 @@ FIXED_LOT = 0.01
 # Tope de riesgo real por trade con lote fijo, como fracción del capital operativo (None = sin tope)
 MAX_RISK_PER_TRADE_PCT = 0.03
 
+# Filtro de spread: omitir si spread > fracción del TP esperado
+MAX_SPREAD_FRACTION_OF_TP = 0.10
+
+# --- Seguridad de cuenta: solo demo por defecto ---
+ALLOW_LIVE_ACCOUNT = False
+
 # --- Salida de posiciones (monitor): SL escalonado + trailing por ATR tras TP2 ---
 ATR_TRAILING_MULTIPLIER = 2.0
+
