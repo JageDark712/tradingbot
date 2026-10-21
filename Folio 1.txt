@@ -1,0 +1,22 @@
+La estrategia, llamada NasProfit, es un sistema de scalping diseñado para operar específicamente el Nasdaq durante su ventana de mayor volatilidad al abrir el mercado de Nueva York. A continuación, te detallo las reglas y el funcionamiento paso a paso:
+
+Parámetros básicos
+
+•	Instrumento: Nasdaq.
+•	Horario de operativa: 9:30 AM a 10:40 AM (hora de Nueva York).
+•	Temporalidades: Gráfico de 15 minutos (M15) para análisis estructural y gráfico de 1 minuto (M1) para la ejecución.
+
+Reglas de ejecución (Paso a paso)
+
+1.  Análisis estructural (M15): A las 9:30 AM, identifica y marca en el gráfico de 15 minutos todos los altos y bajos que no hayan sido rotos por el precio. Santiago define estos niveles basándose en los cambios de color de las velas: un alto ocurre cuando una vela verde es seguida por una roja; un bajo, cuando una roja es seguida por una verde (7:31 - 9:46).
+2.  Rompimiento (M1): Cambia al gráfico de 1 minuto. Debes esperar a que el precio rompa un nivel marcado en M15. Si rompe un bajo, buscarás ventas; si rompe un alto, buscarás compras. La dirección del mercado se sigue según lo que el precio rompa, sin intentar predecir el movimiento (10:10 - 11:14).
+3.  Retroceso (M1): Una vez ocurrido el rompimiento, espera a que el precio regrese al nivel roto. Se requiere como mínimo una vela contraria al movimiento principal que toque dicho nivel (11:35 - 12:15).
+4.  Confirmación (Momento): En el nivel, busca un patrón de continuación, siendo el más recomendado la vela envolvente. Apenas cierre esta vela, se ejecuta la operación (12:21 - 14:08).
+
+Gestión de riesgo
+
+•	El objetivo es un ratio 1:1. La idea detrás de este sistema es mantener la operativa simple para proteger la salud mental del trader, evitando decisiones complejas o prolongadas bajo presión (14:14 - 14:55).
+•	La estrategia se enfoca en seguir la tendencia diaria que suele formar el Nasdaq durante ese horario específico (18:19 - 19:12).
+
+
+
