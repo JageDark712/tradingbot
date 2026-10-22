@@ -18,5 +18,20 @@ Gestión de riesgo
 •	El objetivo es un ratio 1:1. La idea detrás de este sistema es mantener la operativa simple para proteger la salud mental del trader, evitando decisiones complejas o prolongadas bajo presión (14:14 - 14:55).
 •	La estrategia se enfoca en seguir la tendencia diaria que suele formar el Nasdaq durante ese horario específico (18:19 - 19:12).
 
+==================================
+
+La estrategia de scalping presentada por Alex Ruiz se basa en un análisis técnico multi-temporal que utiliza tres gráficos (1h, 5min, 1min) para tomar decisiones de entrada y salida con precisión (16:59 - 17:15). Aquí tienes las seis normas fundamentales para ejecutarla:
+
+1.  Análisis en 1 hora: Debes identificar una zona de resistencia, ver una desaceleración y giro del precio, y confirmar que la estructura esté por debajo de la media móvil exponencial de 50 periodos de 4 horas (18:40 - 19:49).
+2.  Cambio de tendencia en 5 minutos: El activo debe mostrar un cambio en la estructura (máximos y mínimos decrecientes para ventas) y un movimiento correctivo o pullback hacia los niveles de Fibonacci: 0.382, 0.5, 0.618 o 0.75 (20:00 - 20:50).
+3.  Ejecución en 1 minuto: Debes entrar en la posición cuando el precio rompa la media móvil de 50 periodos y una línea de tendencia diagonal en esta temporalidad, confirmando con una vela de volumen elevado (21:21 - 21:50).
+4.  Gestión del riesgo (Stop Loss): El stop loss debe colocarse siempre en el nivel de 0.75 de Fibonacci para protegerse contra señales falsas (21:55 - 22:15).
+5.  Toma de beneficios (Take Profit): El take profit se fija en los mínimos anteriores o gestionando la posición de forma dinámica con la media móvil de 50 periodos en 5 minutos (22:15 - 22:50).
+6.  Consistencia: No casarse con ninguna posición y ejecutar estrictamente cuando se cumplan las normas de la estrategia (2:21 - 2:56).
+
+https://youtu.be/195d-YlEw2g?si=jJ7UJWVa7Cn3Tn56
+
+=======
+
 
 
