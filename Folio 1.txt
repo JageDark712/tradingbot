@@ -1,4 +1,4 @@
-La estrategia, llamada NasProfit, es un sistema de scalping diseñado para operar específicamente el Nasdaq durante su ventana de mayor volatilidad al abrir el mercado de Nueva York. A continuación, te detallo las reglas y el funcionamiento paso a paso:
+ La estrategia, llamada NasProfit, es un sistema de scalping diseñado para operar específicamente el Nasdaq durante su ventana de mayor volatilidad al abrir el mercado de Nueva York. A continuación, te detallo las reglas y el funcionamiento paso a paso:
 
 Parámetros básicos
 
@@ -72,6 +72,22 @@ Aunque la herramienta muestra muchos niveles, esta estrategia se centra únicame
 
 https://youtu.be/AlsXNhTm4AA?si=QJRcAgH7DNsWWVna
 
+====
+
+Para realizar scalping en el oro (XAU/USD) utilizando la herramienta de Fibonacci, el autor del video sugiere la siguiente estrategia y configuración:
+
+Configuración de Fibonacci
+
+•	Nivel clave: El valor principal que debes marcar es el 61.8%.
+•	Personalización: El autor recomienda ajustar los colores de esta línea (por ejemplo, a color blanco) para identificarla fácilmente en el gráfico al trazar la herramienta (1:46 - 2:04).
+
+Estrategia de Scalping
+
+1.  Identificación: Primero, detecta un cambio de tendencia o de movimiento. Puedes apoyarte en medias móviles para visualizar si el gráfico comienza a crear máximos o mínimos menores (0:19 - 0:50).
+2.  Trazado: Aplica el Fibonacci una vez que se confirme el impulso. La idea es esperar a que el precio retroceda y toque la zona del 61.8% (2:09 - 2:24).
+3.  Confirmación: Es crucial no entrar de inmediato. El autor enfatiza esperar una vela de confirmación después de que el precio toque el nivel del 61.8% para evitar caer en trampas de liquidez o manipulación del mercado (3:13 - 3:56).
+4.  Gestión: Coloca un stop loss pequeño pero seguro por fuera de la zona de manipulación. El take profit debe fijarse, como mínimo, superando el impulso anterior (5:03 - 5:24).
+5.  Repetición: La ventaja del scalping en el oro es que, si el gráfico respeta la tendencia y genera un nuevo impulso mayor al anterior, puedes volver a marcar un nuevo Fibonacci y repetir el proceso (2:37 - 2:58).
 
 
 
