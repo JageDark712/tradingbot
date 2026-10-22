@@ -29,9 +29,51 @@ La estrategia de scalping presentada por Alex Ruiz se basa en un análisis técn
 5.  Toma de beneficios (Take Profit): El take profit se fija en los mínimos anteriores o gestionando la posición de forma dinámica con la media móvil de 50 periodos en 5 minutos (22:15 - 22:50).
 6.  Consistencia: No casarse con ninguna posición y ejecutar estrictamente cuando se cumplan las normas de la estrategia (2:21 - 2:56).
 
+Pasos para la ejecución:
+
+1.  Gráfico Horario: Identificar una zona de resistencia, observar desaceleración y giro, y confirmar que el precio esté por debajo de la media móvil exponencial de 50 periodos de 4 horas (18:40 - 19:49).
+2.  Gráfico 5 Minutos: Buscar un cambio de tendencia (máximos y mínimos decrecientes para ventas) y un retroceso (pullback) hacia los niveles de Fibonacci 0.382, 0.5, 0.618 o 0.75 (20:00 - 20:50).
+3.  Gráfico 1 Minuto: Ejecutar la entrada cuando el precio rompa la media móvil de 50 periodos y una línea de tendencia diagonal, validando con un aumento en el volumen (21:21 - 21:50).
+4.  Gestión del riesgo: Colocar el stop loss obligatoriamente en el nivel 0.75 de Fibonacci (21:55 - 22:15).
+5.  Toma de beneficios: Salir en los mínimos anteriores o mediante la gestión dinámica con la media móvil de 50 periodos en 5 minutos (22:15 - 22:50).
+
+La estrategia de scalping expuesta por el ponente utiliza un análisis técnico multi-temporal (1 hora, 5 minutos y 1 minuto) para ejecutar operaciones de manera precisa (16:59 - 17:15). El setup recomienda minimizar el número de indicadores, empleando únicamente la media móvil exponencial de 50 periodos en las tres temporalidades y el volumen en el gráfico de un minuto (08:31 - 08:52).
+
 https://youtu.be/195d-YlEw2g?si=jJ7UJWVa7Cn3Tn56
 
 =======
+
+Esta estrategia de scalping en el gráfico de 1 minuto se basa exclusivamente en la acción del precio y el uso de la herramienta de Retroceso de Fibonacci para capturar movimientos predecibles dentro de una tendencia micro. Aquí tienes los pasos clave explicados:
+
+Reglas de la Estrategia
+
+1.  Identificación de Tendencia (1:50 - 2:00): Determina la tendencia actual. En una tendencia bajista, busca mínimos más bajos; en una alcista, máximos más altos.
+2.  Ruptura de Estructura (1:59 - 2:05): Espera a que el precio rompa la estructura previa. Esto confirma que el precio realizará un retroceso antes de continuar la tendencia principal.
+3.  La "Zona Dorada" (1:30 - 1:45): Utiliza la herramienta de Fibonacci y dibuja desde el último máximo/mínimo antes del rompimiento hasta el inicio del retroceso. Debes enfocarte exclusivamente en los niveles 0.5 y 0.618.
+4.  Entrada y Salida (2:13 - 2:45):
+•	Entrada: Entra a favor de la tendencia cuando el precio toque la zona del 0.5 o 0.618.
+•	Salida: Coloca tu Take Profit en el mínimo o máximo previo de la oscilación anterior.
+•	Stop Loss: Se coloca en el nivel 1 de Fibonacci.
+
+Consideraciones Importantes
+
+•	Gestión de Momento (2:45 - 2:50): Si notas que el impulso se detiene o el mercado no respeta la estructura, cierra la operación rápidamente.
+•	Flexibilidad (5:05 - 5:20): Las pérdidas son parte de la estrategia. Si te toca el Stop Loss, puede ser una señal de que la tendencia está cambiando y debes empezar a buscar posiciones en la dirección opuesta.
+•	Eficiencia: El objetivo es entrar y salir rápido, con operaciones que suelen durar entre 2 y 10 minutos (4:28 - 4:32).
+
+herramienta fibonacci
+Niveles a destacar: La "Zona Dorada" (1:30 - 1:45)
+
+Aunque la herramienta muestra muchos niveles, esta estrategia se centra únicamente en el rango de los 0.5 a 0.618:
+
+•	Zona Dorada (0.5 – 0.618): Es el área donde se busca la confirmación de entrada (2:13 - 2:17). Estos niveles actúan como "imanes" donde el precio tiende a rebotar antes de continuar con la tendencia establecida.
+•	Stop Loss: Se posiciona en el nivel 1 de la herramienta (3:30 - 3:32).
+
+
+https://youtu.be/AlsXNhTm4AA?si=QJRcAgH7DNsWWVna
+
+
+
 
 
 
